@@ -224,7 +224,7 @@ class ForwardTuner extends OpMode {
  * @version 2.0, 6/26/2025
  */
 class LateralTuner extends OpMode {
-    public static double DISTANCE = 48;
+    public static double DISTANCE = 90;
 
     @Override
     public void init() {
@@ -322,7 +322,7 @@ class TurnTuner extends OpMode {
  */
 class ForwardVelocityTuner extends OpMode {
     private final ArrayList<Double> velocities = new ArrayList<>();
-    public static double DISTANCE = 48;
+    public static double DISTANCE = 94;
     public static double RECORD_NUMBER = 10;
 
     private boolean end;
@@ -428,7 +428,7 @@ class ForwardVelocityTuner extends OpMode {
 class LateralVelocityTuner extends OpMode {
     private final ArrayList<Double> velocities = new ArrayList<>();
 
-    public static double DISTANCE = 48;
+    public static double DISTANCE = 90;
     public static double RECORD_NUMBER = 10;
 
     private boolean end;
@@ -483,7 +483,7 @@ class LateralVelocityTuner extends OpMode {
                 end = true;
                 stopRobot();
             } else {
-                follower.setTeleOpDrive(0,1,0,true);
+                follower.setTeleOpDrive(0,-1,0,true);
                 double currentVelocity = Math.abs(follower.getVelocity().dot(new Vector(1, Math.PI / 2)));
                 velocities.add(currentVelocity);
                 velocities.remove(0);
@@ -658,7 +658,7 @@ class LateralZeroPowerAccelerationTuner extends OpMode {
     public void start() {
         follower.startTeleopDrive(false);
         follower.update();
-        follower.setTeleOpDrive(0,1,0,true);
+        follower.setTeleOpDrive(0,-1,0,true);
     }
 
     /**
