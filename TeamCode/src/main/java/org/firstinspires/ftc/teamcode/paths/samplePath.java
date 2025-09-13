@@ -48,7 +48,7 @@ public class samplePath extends OpMode{
         shootTimer.reset();
         leftFeeder.setPower(SHOOT_POWER);
         rightFeeder.setPower(SHOOT_POWER);
-        launcher.setPower(SHOOT_POWER);
+        launcher.setPower(SHOOT_POWER); //
     }
 
     private void maybeStopShoot() {
