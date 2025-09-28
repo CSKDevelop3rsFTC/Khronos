@@ -1,15 +1,14 @@
 package org.firstinspires.ftc.teamcode.paths;
+
 import static org.firstinspires.ftc.robotcore.external.BlocksOpModeCompanion.hardwareMap;
 import static org.firstinspires.ftc.robotcore.external.BlocksOpModeCompanion.telemetry;
 
-import static java.lang.Thread.sleep;
-
 import com.pedropathing.follower.Follower;
-import com.pedropathing.geometry.BezierCurve;
 import com.pedropathing.geometry.BezierLine;
 import com.pedropathing.geometry.Pose;
 import com.pedropathing.paths.PathChain;
 import com.pedropathing.util.Timer;
+
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.hardware.CRServo;
@@ -17,56 +16,119 @@ import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.PIDFCoefficients;
+import com.qualcomm.robotcore.util.ElapsedTime;
 
 import org.firstinspires.ftc.teamcode.pedroPathing.Constants;
 
 @Autonomous(name = "samplePath", group = "Autonomous")
-public class samplePath extends OpMode{
+public class samplePath extends OpMode {
+
+    // Pedro core
     private Follower follower;
     private Timer pathTimer;
     private int pathState;
-    public CRServo leftFeeder = null;
-    public CRServo rightFeeder = null;
-    public DcMotorEx launcher = null;
-    private boolean isShooting = false;
-    private final double SHOOT_TIME = 2.0; // seconds
-    private final double SHOOT_POWER = -1.0;
-    private final com.qualcomm.robotcore.util.ElapsedTime shootTimer = new com.qualcomm.robotcore.util.ElapsedTime();
 
-    //poses
-    private final Pose startPose = new Pose(8,51,Math.toDegrees(0));
-    private final Pose startPose2 = new Pose(118,21,Math.toDegrees(0));
-    private final Pose endPose = new Pose(50,0,Math.toDegrees(90));
-    private final Pose corna0 = new Pose(20,98,Math.toDegrees(335));
-    private final Pose corna1 = new Pose(118,21,Math.toDegrees(335));
+    // Shooter hardware (names match your TeleOp)
+    private CRServo leftFeeder, rightFeeder;
+    private DcMotorEx launcher;
 
-    private PathChain forward, backForward, rotate;
+    // Shooter timings from your teleop
+    private final double  mshooterSpeed   = 0.73;     // launcher power
+    private final double  sshooterSpeed   = -1.0;     // feeder power
+    private final long    shotSpaceTimeMs = 200;      // feeder ON
+    private final long    singleShotTimeMs= 850;      // feeder OFF
+    private final long    chargeUpTimeMs  = 1600;     // spin-up
 
-    private void startShootThree() {
-        if (isShooting) return;
-        isShooting = true;
-        shootTimer.reset();
-        leftFeeder.setPower(SHOOT_POWER);
-        rightFeeder.setPower(SHOOT_POWER);
-        launcher.setPower(SHOOT_POWER); //
-    }
+    // Shooter FSM
+    private enum ShooterState { IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, DONE }
+    private ShooterState shooterState = ShooterState.IDLE;
+    private int shotsRemaining = 0;
+    private final ElapsedTime shooterTimer = new ElapsedTime();
 
-    private void maybeStopShoot() {
-        if (isShooting && shootTimer.seconds() >= SHOOT_TIME) {
-            leftFeeder.setPower(0);
-            rightFeeder.setPower(0);
-            launcher.setPower(0);
-            isShooting = false;
+    // Field poses (positions only; heading will be computed from the segment)
+    private final Pose startPose = new Pose(88, 8, 0);         // heading ignored here
+    private final Pose endPose   = new Pose(110, 127, 0);      // heading ignored here
+
+    private PathChain path;
+
+    // === Shooter helpers ===
+    private void requestBurst3() {
+        if (shooterState == ShooterState.IDLE || shooterState == ShooterState.DONE) {
+            shotsRemaining = 3;
+            launcher.setPower(mshooterSpeed);
+            shooterTimer.reset();
+            shooterState = ShooterState.SPIN_UP;
         }
     }
 
-    public void buildPath() {
+    private void updateShooter() {
+        switch (shooterState) {
+            case IDLE:
+            case DONE:
+                leftFeeder.setPower(0);
+                rightFeeder.setPower(0);
+                launcher.setPower(0);
+                break;
 
-         forward = follower.pathBuilder()
-                .addPath(new BezierLine(startPose, corna1))
-                .setLinearHeadingInterpolation(startPose.getHeading(), corna1.getHeading())
-                 .addParametricCallback(1.0, () -> startShootThree())
-                 .build();
+            case SPIN_UP:
+                if (shooterTimer.milliseconds() >= chargeUpTimeMs) {
+                    leftFeeder.setPower(sshooterSpeed);
+                    rightFeeder.setPower(sshooterSpeed);
+                    shooterTimer.reset();
+                    shooterState = ShooterState.FEED;
+                }
+                break;
+
+            case FEED:
+                if (shooterTimer.milliseconds() >= shotSpaceTimeMs) {
+                    leftFeeder.setPower(0);
+                    rightFeeder.setPower(0);
+                    shotsRemaining = Math.max(0, shotsRemaining - 1);
+                    shooterTimer.reset();
+                    shooterState = ShooterState.INTERSHOT;
+                }
+                break;
+
+            case INTERSHOT:
+                if (shooterTimer.milliseconds() >= singleShotTimeMs) {
+                    if (shotsRemaining > 0) {
+                        leftFeeder.setPower(sshooterSpeed);
+                        rightFeeder.setPower(sshooterSpeed);
+                        shooterTimer.reset();
+                        shooterState = ShooterState.FEED;
+                    } else {
+                        shooterState = ShooterState.SPIN_DOWN;
+                    }
+                }
+                break;
+
+            case SPIN_DOWN:
+                launcher.setPower(0);
+                shooterState = ShooterState.DONE;
+                break;
+        }
+    }
+
+    // Compute the straight-line heading from start to end (radians)
+    private double segmentHeading() {
+        double dx = endPose.getX() - startPose.getX();
+        double dy = endPose.getY() - startPose.getY();
+        return Math.atan2(dy, dx);
+    }
+
+    // === Pedro path ===
+    public void buildPath() {
+        double h = segmentHeading();
+
+        // Build a straight path where heading points along the line the whole time
+        Pose startWithH = new Pose(startPose.getX(), startPose.getY(), h);
+        Pose endWithH   = new Pose(endPose.getX(),   endPose.getY(),   h);
+
+        path = follower.pathBuilder()
+                .addPath(new BezierLine(startWithH, endWithH))
+                .setLinearHeadingInterpolation(h, h)   // constant along-line heading
+                .addParametricCallback(1.0, this::requestBurst3)
+                .build();
     }
 
     public void setPathState(int pState) {
@@ -74,70 +136,67 @@ public class samplePath extends OpMode{
         pathTimer.resetTimer();
     }
 
-    public void pathUpdate(){
-        switch(pathState){
+    public void pathUpdate() {
+        switch (pathState) {
             case 0:
-                follower.followPath(forward,true);
+                follower.followPath(path, true);
                 setPathState(1);
                 break;
+
             case 1:
-                if(!follower.isBusy()){
-                    setPathState(2);
-                }
-                break;
-            case 2:
-                if(pathTimer.getElapsedTimeSeconds() > 2.5){
-                follower.followPath(backForward, true);
-                setPathState(3);
-                }
-                break;
-            case 3:
-                if(follower.getCurrentTValue() > 0.98){
+                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
                     setPathState(-1);
                 }
                 break;
+
+            default:
+                break;
         }
     }
-    @Override
-    public void loop() {
-        // Loop robot movement and odometry values
-        follower.update();
-        // Loop the finite-state machine
-        pathUpdate();
-        maybeStopShoot();
-        // Feedback to Driver Hub
-        telemetry.addData("path state", pathState);
-        telemetry.addData("x", follower.getPose().getX());
-        telemetry.addData("y", follower.getPose().getY());
-        telemetry.addData("heading", follower.getPose().getHeading());
-        telemetry.update();
-    }
 
-    /** This method is called once at the init of the OpMode. **/
+    // === OpMode lifecycle ===
     @Override
     public void init() {
         pathTimer = new Timer();
-        follower = Constants.createFollower(hardwareMap);
-        follower.setStartingPose(startPose);
-        launcher = hardwareMap.get(DcMotorEx.class, "launcher");
-        leftFeeder = hardwareMap.get(CRServo.class, "left_feeder");
-        rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
-        launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-        launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
-        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER,
-                new PIDFCoefficients(300, 0, 0, 10)); // tune for your robot
+        follower = Constants.createFollower(hardwareMap);
+        // Start pose uses computed heading so odometry and path agree
+        follower.setStartingPose(new Pose(startPose.getX(), startPose.getY(), segmentHeading()));
+
+        // Shooter HW
+        launcher    = hardwareMap.get(DcMotorEx.class, "launcher");
+        leftFeeder  = hardwareMap.get(CRServo.class, "left_feeder");
+        rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
         rightFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
         leftFeeder.setPower(0);
         rightFeeder.setPower(0);
+
+        launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER,
+                new PIDFCoefficients(300, 0, 0, 10));
+
         buildPath();
     }
 
-    /** This method is called once at the start of the OpMode. It runs all the setup actions, including building paths and starting the path system **/
     @Override
     public void start() {
         setPathState(0);
     }
 
+    @Override
+    public void loop() {
+        follower.update();
+        pathUpdate();
+        updateShooter();
+
+        telemetry.addData("path state", pathState);
+        telemetry.addData("t", "%.2f", follower.getCurrentTValue());
+        telemetry.addData("pose", "(%.1f, %.1f)", follower.getPose().getX(), follower.getPose().getY());
+        telemetry.addData("heading rad", "%.3f", follower.getPose().getHeading());
+        telemetry.addData("heading deg", "%.1f", Math.toDegrees(follower.getPose().getHeading()));
+        telemetry.addData("shooter", shooterState);
+        telemetry.update();
+    }
 }
