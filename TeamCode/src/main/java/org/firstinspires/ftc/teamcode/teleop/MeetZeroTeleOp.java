@@ -6,10 +6,6 @@ import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.CRServo;
-import com.qualcomm.robotcore.hardware.Gamepad;
-import com.qualcomm.robotcore.hardware.PIDFCoefficients;
-import com.qualcomm.robotcore.hardware.Servo;
-import com.qualcomm.robotcore.hardware.ServoImplEx;
 
 @TeleOp(name="MeetZeroTeleOp", group="Robot")
 public class MeetZeroTeleOp extends LinearOpMode {
@@ -23,10 +19,17 @@ public class MeetZeroTeleOp extends LinearOpMode {
     public CRServo rightFeeder = null;
     public DcMotorEx launcher = null;
 
-    public double  mshooterSpeed = 0.73;
+    // --- Shooter params (same behavior as before) ---
+    public double  mshooterSpeed = 0.63;                 // initial launcher power
     public double  sshooterSpeed = -1;
-    public long    shotSpaceTime = (long) (0.20 * 1000);
-    public long    singleShotTime = (long) (0.85 * 1000);
+    public long    shotSpaceTime = (long) (0.23 * 1000); // feeder ON per shot
+    public long    singleShotTime = (long) (0.2 * 1000);// recovery BEFORE 2nd shot
+
+    // --- NEW: post-first-shot boost and shorter recovery for subsequent shots ---
+    public double  postFirstPower = 0.90;                // boost power after 1st shot
+    public long    singleShotTimeAfterFirst = (long)(0.2 * 1000); // shorter recovery after 1st
+    private boolean firstShotDone = false;
+
     public long    chargeUpTime = (long) (1.6 * 1000);
     public boolean shootTimer = false;
 
@@ -43,39 +46,30 @@ public class MeetZeroTeleOp extends LinearOpMode {
     private boolean continuousRequested = false;  // left trigger hold
     private int burstShots = 0;                   // for 3-shot burst
 
-
     public void initialize() {
-
-        frontLeftDrive = hardwareMap.get(DcMotor.class, "frontLeftDrive");
+        frontLeftDrive  = hardwareMap.get(DcMotor.class, "frontLeftDrive");
         frontRightDrive = hardwareMap.get(DcMotor.class, "frontRightDrive");
-        backLeftDrive = hardwareMap.get(DcMotor.class, "backLeftDrive");
-        backRightDrive = hardwareMap.get(DcMotor.class, "backRightDrive");
-
+        backLeftDrive   = hardwareMap.get(DcMotor.class, "backLeftDrive");
+        backRightDrive  = hardwareMap.get(DcMotor.class, "backRightDrive");
 
         frontLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
         backLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
         frontRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
         backRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
 
-        // launcher + feeders
-        launcher = hardwareMap.get(DcMotorEx.class, "launcher");
-        leftFeeder = hardwareMap.get(CRServo.class, "left_feeder");
+        launcher    = hardwareMap.get(DcMotorEx.class, "launcher");
+        leftFeeder  = hardwareMap.get(CRServo.class, "left_feeder");
         rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
         rightFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
         leftFeeder.setPower(0);
         rightFeeder.setPower(0);
-
     }
 
     public void driveMovement(double driveSpeed) {
-        double vertical;
-        double horizontal;
-        double pivot;
-
-        horizontal = gamepad1.left_stick_x;
-        vertical = gamepad1.left_stick_y;
-        pivot = -gamepad1.right_stick_x * 0.5;
+        double horizontal = gamepad1.left_stick_x;
+        double vertical   = gamepad1.left_stick_y;
+        double pivot      = -gamepad1.right_stick_x * 0.5;
 
         frontRightDrive.setPower(((vertical + horizontal) - pivot) * driveSpeed);
         frontLeftDrive.setPower(((vertical - horizontal) + pivot) * driveSpeed);
@@ -84,21 +78,19 @@ public class MeetZeroTeleOp extends LinearOpMode {
     }
 
     public void driveController() {
-        if (gamepad1.right_trigger > 0) {
-            driveMovement(0.5);
-        }
-        else {
-            driveMovement(1);
-        }
+        if (gamepad1.right_trigger > 0) driveMovement(0.5);
+        else                             driveMovement(1.0);
     }
 
     public void shooter() {
-        boolean triggerHeld = gamepad1.left_trigger > 0.15;
+        boolean triggerHeld   = gamepad1.left_trigger > 0.15;
         boolean bumperPressed = gamepad1.left_bumper;
 
+        // Trigger: start/stop continuous
         if (triggerHeld && !prevTriggerHeld) {
             continuousRequested = true;
             if (shooterState == ShooterState.IDLE || shooterState == ShooterState.SPIN_DOWN) {
+                firstShotDone = false;                      // reset boost flag
                 launcher.setPower(mshooterSpeed);
                 shooterState = ShooterState.SPIN_UP;
                 shooterTimer.reset();
@@ -115,10 +107,12 @@ public class MeetZeroTeleOp extends LinearOpMode {
         }
         prevTriggerHeld = triggerHeld;
 
+        // Bumper: 3-shot burst
         if (bumperPressed && !prevBumper) {
-            if (shooterState != ShooterState.COOLDOWN && shootTimer == false) {
+            if (shooterState != ShooterState.COOLDOWN && !shootTimer) {
                 continuousRequested = false;
                 burstShots = 3;
+                firstShotDone = false;                      // reset boost flag
                 launcher.setPower(mshooterSpeed);
                 shooterState = ShooterState.SPIN_UP;
                 shooterTimer.reset();
@@ -144,21 +138,30 @@ public class MeetZeroTeleOp extends LinearOpMode {
 
             case FEED:
                 if (shooterTimer.milliseconds() >= shotSpaceTime) {
+                    // Shot just completed
                     leftFeeder.setPower(0);
                     rightFeeder.setPower(0);
+
+                    // NEW: after the FIRST completed shot, rapidly boost to full power
+                    if (!firstShotDone) {
+                        firstShotDone = true;
+                        launcher.setPower(postFirstPower);   // immediate ramp to 100%
+                    }
+
+                    // bookkeeping and move to recovery
+                    if (!continuousRequested && burstShots > 0) burstShots--;
                     shooterTimer.reset();
                     shooterState = ShooterState.INTERSHOT;
-
-                    if (!continuousRequested && burstShots > 0) {
-                        burstShots--;
-                    }
                 }
                 break;
 
             case INTERSHOT:
-                if (shooterTimer.milliseconds() >= singleShotTime) {
+                // Use shorter recovery AFTER first shot
+                long needed = firstShotDone ? singleShotTimeAfterFirst : singleShotTime;
+
+                if (shooterTimer.milliseconds() >= needed) {
                     boolean doMoreContinuous = continuousRequested;
-                    boolean doMoreBurst = (!continuousRequested && burstShots > 0);
+                    boolean doMoreBurst      = (!continuousRequested && burstShots > 0);
 
                     if (doMoreContinuous || doMoreBurst) {
                         leftFeeder.setPower(sshooterSpeed);
@@ -194,16 +197,17 @@ public class MeetZeroTeleOp extends LinearOpMode {
                 break;
         }
 
+        // Hard cancel
         if (gamepad1.y) {
             continuousRequested = false;
             burstShots = 0;
+            firstShotDone = false;
             launcher.setPower(0);
             leftFeeder.setPower(0);
             rightFeeder.setPower(0);
             shootTimer = false;
             shooterState = ShooterState.IDLE;
         }
-
     }
 
     public void shotCooldown() {
@@ -214,18 +218,12 @@ public class MeetZeroTeleOp extends LinearOpMode {
 
     @Override
     public void runOpMode() {
-
         initialize();
-
         waitForStart();
-
-
         while (opModeIsActive()) {
-
             driveController();
             shooter();
             sleep(50);
         }
-
     }
 }
