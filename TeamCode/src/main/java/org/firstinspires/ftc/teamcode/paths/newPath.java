@@ -26,19 +26,24 @@ public class newPath extends OpMode {
     private int pathState;
     private PathChain forward;
 
+    // Three separate push legs
+    private PathChain pushLeg1; // endPose -> balls0
+    private PathChain pushLeg2; // balls0 -> push0
+    private PathChain pushLeg3; // push0  -> push1
+
     // Shooter hardware
     private CRServo leftFeeder, rightFeeder;
     private DcMotorEx launcher;
 
-    // Open-loop params (editable like TeleOp)
-    private double  mshooterSpeed    = 0.7;    // initial launcher power
-    private double  feederPower      = -1.0;   // flip sign or servo directions if needed
-    private long    shotSpaceTimeMs  = 200;    // feeder ON per shot
-    private long    singleShotTimeMs = 850;    // recovery BEFORE 2nd shot
+    // === Match TeleOp defaults (editable) ===
+    private double  mshooterSpeed    = 0.65;   // initial launcher power
+    private double  feederPower      = -1.0;   // flip if needed
+    private long    shotSpaceTimeMs  = 270;    // feeder ON per shot
+    private long    singleShotTimeMs = 200;    // recovery BEFORE 2nd shot
 
-    // Post-first-shot boost + shorter recovery (TeleOp-style)
-    private double  postFirstPower = 0.90;               // launcher power after first shot
-    private long    singleShotTimeAfterFirst = 200;      // recovery AFTER first shot (ms)
+    // Post-first-shot boost + shorter recovery (same as your TeleOp)
+    private double  postFirstPower = 0.92;     // launcher power after first shot
+    private long    singleShotTimeAfterFirst = 200; // recovery AFTER first shot (ms)
     private boolean firstShotDone = false;
 
     // Spin-up before first feed
@@ -50,23 +55,60 @@ public class newPath extends OpMode {
     private int shotsRemaining = 0;
     private final ElapsedTime shooterTimer = new ElapsedTime();
 
-    // Poses
+    // Poses (yours)
     private final Pose startPose = new Pose(12, 18, Math.toRadians(0));
     private final Pose endPose   = new Pose(132, 48, Math.toRadians(45));
 
-    // One-shot trigger guard
+    // push row closest to zone
+    private final Pose balls0 = new Pose (55, -30, Math.toRadians(0));
+    private final Pose push0  = new Pose (55, -48, Math.toRadians(0));
+    private final Pose push1  = new Pose (24, -48, Math.toRadians(0));
+
+    // Guards
     private boolean burstTriggered = false;
+
+    // Push sequence flags
+    private boolean leg1Started = false, leg1Finished = false;
+    private boolean leg2Started = false, leg2Finished = false;
+    private boolean leg3Started = false, leg3Finished = false;
+
+    // Wait a beat between shooting and pushing
+    private final long POST_SHOOT_SETTLE_MS = 300;
+    private final ElapsedTime settleTimer = new ElapsedTime();
 
     // Auto stop guards
     private final long AUTO_TIMEOUT_MS = 20000; // safety stop after 20 s
     private final ElapsedTime matchTimer = new ElapsedTime();
 
-    // Build path
+    // Build first path (shooting run)
     private void buildPath() {
         forward = follower.pathBuilder()
                 .addPath(new BezierLine(startPose, endPose))
                 .setLinearHeadingInterpolation(startPose.getHeading(), endPose.getHeading())
-                .addParametricCallback(0.90, this::requestBurst3)   // fire before end
+                .addParametricCallback(0.90, this::requestBurst3)
+                .build();
+    }
+
+    // Build each push leg as its own PathChain (constant heading = 0 each leg)
+    private void buildPushLegs() {
+        double h0 = Math.toRadians(0);
+
+        // Leg 1: endPose -> balls0 (turn from 45° to 0° then hold 0°)
+        pushLeg1 = follower.pathBuilder()
+                .addPath(new BezierLine(endPose, balls0))
+                .setLinearHeadingInterpolation(endPose.getHeading(), h0)
+                .build();
+
+        // Leg 2: balls0 -> push0 (hold 0°)
+        pushLeg2 = follower.pathBuilder()
+                .addPath(new BezierLine(balls0, push0))
+                .setLinearHeadingInterpolation(h0, h0)
+                .build();
+
+        // Leg 3: push0 -> push1 (hold 0°)
+        pushLeg3 = follower.pathBuilder()
+                .addPath(new BezierLine(push0, push1))
+                .setLinearHeadingInterpolation(h0, h0)
                 .build();
     }
 
@@ -154,13 +196,73 @@ public class newPath extends OpMode {
                 follower.followPath(forward, true);
                 setPathState(1);
                 break;
+
             case 1:
+                // Finish first path
+                boolean firstPathDone = (follower.getCurrentTValue() >= 0.98 || !follower.isBusy());
+
+                // If we haven't triggered yet (failsafe), trigger at t>=0.90
                 if (!burstTriggered && follower.getCurrentTValue() >= 0.90) {
                     requestBurst3();
                 }
-                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
-                    setPathState(-1); // path finished
+
+                // When path is done and shooter finishes, wait briefly then start leg 1
+                if (firstPathDone && (shooterState == ShooterState.DONE || shooterState == ShooterState.IDLE)) {
+                    settleTimer.reset();
+                    setPathState(2); // settle before leg 1
                 }
+                break;
+
+            case 2: // settle window
+                if (settleTimer.milliseconds() >= POST_SHOOT_SETTLE_MS) {
+                    if (!leg1Started) {
+                        buildPushLegs(); // build once, right before starting the sequence
+                        follower.followPath(pushLeg1, true);
+                        leg1Started = true;
+                    }
+                    setPathState(3);
+                }
+                break;
+
+            case 3: // leg 1 active
+                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
+                    leg1Finished = true;
+                    setPathState(4);
+                }
+                break;
+
+            case 4: // start leg 2
+                if (!leg2Started) {
+                    follower.followPath(pushLeg2, true);
+                    leg2Started = true;
+                }
+                setPathState(5);
+                break;
+
+            case 5: // leg 2 active
+                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
+                    leg2Finished = true;
+                    setPathState(6);
+                }
+                break;
+
+            case 6: // start leg 3
+                if (!leg3Started) {
+                    follower.followPath(pushLeg3, true);
+                    leg3Started = true;
+                }
+                setPathState(7);
+                break;
+
+            case 7: // leg 3 active
+                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
+                    leg3Finished = true;
+                    setPathState(8);
+                }
+                break;
+
+            case 8: // all legs done
+                // handled in loop() for stop
                 break;
         }
     }
@@ -181,16 +283,20 @@ public class newPath extends OpMode {
         rightFeeder.setPower(0);
 
         // Open-loop behavior like TeleOp
-        launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
 
-        buildPath();
+        buildPath(); // first path only; push legs are built right before the sequence
     }
 
     @Override
     public void start() {
         matchTimer.reset();
         burstTriggered = false;
+
+        leg1Started = leg1Finished = false;
+        leg2Started = leg2Finished = false;
+        leg3Started = leg3Finished = false;
+
         setPathState(0);
     }
 
@@ -200,8 +306,9 @@ public class newPath extends OpMode {
         pathUpdate();
         updateShooter();
 
-        // Auto end once path finished and shooter is done
-        if (pathState == -1 && (shooterState == ShooterState.DONE || shooterState == ShooterState.IDLE)) {
+        // Auto end once all legs finished and shooter is done (or idle)
+        boolean allLegsDone = leg1Finished && leg2Finished && leg3Finished;
+        if (allLegsDone && (shooterState == ShooterState.DONE || shooterState == ShooterState.IDLE)) {
             requestOpModeStop();
         }
 
@@ -218,6 +325,9 @@ public class newPath extends OpMode {
         telemetry.addData("x", follower.getPose().getX());
         telemetry.addData("y", follower.getPose().getY());
         telemetry.addData("heading", Math.toDegrees(follower.getPose().getHeading()));
+        telemetry.addData("leg1", "%b/%b", leg1Started, leg1Finished);
+        telemetry.addData("leg2", "%b/%b", leg2Started, leg2Finished);
+        telemetry.addData("leg3", "%b/%b", leg3Started, leg3Finished);
         telemetry.update();
     }
 
