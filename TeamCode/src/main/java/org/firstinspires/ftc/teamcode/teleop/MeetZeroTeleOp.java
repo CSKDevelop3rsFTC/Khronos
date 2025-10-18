@@ -23,17 +23,27 @@ public class MeetZeroTeleOp extends LinearOpMode {
     public double  mshooterSpeed = 0.63;                 // initial launcher power
     public double  sshooterSpeed = -1;
     public long    shotSpaceTime = (long) (0.23 * 1000); // feeder ON per shot
-    public long    singleShotTime = (long) (0.2 * 1000);// recovery BEFORE 2nd shot
+    public long    singleShotTime = (long) (0.24 * 1000);// recovery BEFORE 2nd shot
 
     // --- NEW: post-first-shot boost and shorter recovery for subsequent shots ---
-    public double  postFirstPower = 0.90;                // boost power after 1st shot
+    public double  postFirstPower = 0.86;                // boost power after 1st shot
     public long    singleShotTimeAfterFirst = (long)(0.2 * 1000); // shorter recovery after 1st
     private boolean firstShotDone = false;
 
     public long    chargeUpTime = (long) (1.6 * 1000);
     public boolean shootTimer = false;
 
-    private enum ShooterState { IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, COOLDOWN }
+    // NEW: extra-shot wait time and flag
+    private static final long FOURTH_DELAY_MS = 200;     // 1 second pause before 4th
+    private static final long BRAKE_MS = 400;             // 100 ms reverse brake
+    private boolean delayedFourthEnabled = false;         // only for 3-shot burst
+
+    private enum ShooterState {
+        IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, COOLDOWN,
+        // NEW states
+        DELAY_BEFORE_FOURTH,
+        POST_FOURTH_BRAKE
+    }
     private ShooterState shooterState = ShooterState.IDLE;
     private com.qualcomm.robotcore.util.ElapsedTime shooterTimer =
             new com.qualcomm.robotcore.util.ElapsedTime();
@@ -107,11 +117,12 @@ public class MeetZeroTeleOp extends LinearOpMode {
         }
         prevTriggerHeld = triggerHeld;
 
-        // Bumper: 3-shot burst
+        // Bumper: 3-shot burst (+ delayed 4th after 1s)
         if (bumperPressed && !prevBumper) {
             if (shooterState != ShooterState.COOLDOWN && !shootTimer) {
                 continuousRequested = false;
                 burstShots = 3;
+                delayedFourthEnabled = true;               // arm the delayed 4th
                 firstShotDone = false;                      // reset boost flag
                 launcher.setPower(mshooterSpeed);
                 shooterState = ShooterState.SPIN_UP;
@@ -142,14 +153,29 @@ public class MeetZeroTeleOp extends LinearOpMode {
                     leftFeeder.setPower(0);
                     rightFeeder.setPower(0);
 
-                    // NEW: after the FIRST completed shot, rapidly boost to full power
+                    // After the FIRST completed shot, rapidly boost to higher power
                     if (!firstShotDone) {
                         firstShotDone = true;
-                        launcher.setPower(postFirstPower);   // immediate ramp to 100%
+                        launcher.setPower(postFirstPower);   // immediate ramp
                     }
 
-                    // bookkeeping and move to recovery
-                    if (!continuousRequested && burstShots > 0) burstShots--;
+                    // If we're still in a burst (first three), decrement and proceed
+                    if (!continuousRequested && burstShots > 0) {
+                        burstShots--;
+                        shooterTimer.reset();
+                        shooterState = ShooterState.INTERSHOT;
+                        break;
+                    }
+
+                    // If this was the delayed 4th shot: apply a brief reverse brake
+                    if (!continuousRequested && !delayedFourthEnabled && burstShots == 0 && firstShotDone) {
+                        launcher.setPower(-0.01);            // tiny reverse to decelerate
+                        shooterTimer.reset();
+                        shooterState = ShooterState.POST_FOURTH_BRAKE;
+                        break;
+                    }
+
+                    // Otherwise continue normal intershot handling
                     shooterTimer.reset();
                     shooterState = ShooterState.INTERSHOT;
                 }
@@ -169,9 +195,39 @@ public class MeetZeroTeleOp extends LinearOpMode {
                         shooterTimer.reset();
                         shooterState = ShooterState.FEED;
                     } else {
-                        shooterState = ShooterState.SPIN_DOWN;
-                        shooterTimer.reset();
+                        // No more burst shots, but we owe a delayed fourth
+                        if (!continuousRequested && delayedFourthEnabled) {
+                            shooterState = ShooterState.DELAY_BEFORE_FOURTH;
+                            shooterTimer.reset();
+                        } else {
+                            shooterState = ShooterState.SPIN_DOWN;
+                            shooterTimer.reset();
+                        }
                     }
+                }
+                break;
+
+            // Wait 1 second, then fire a single final shot
+            case DELAY_BEFORE_FOURTH:
+                // keep launcher spinning at current power during the pause
+                if (shooterTimer.milliseconds() >= FOURTH_DELAY_MS) {
+                    // feed one last time
+                    leftFeeder.setPower(sshooterSpeed);
+                    rightFeeder.setPower(sshooterSpeed);
+                    delayedFourthEnabled = false; // only once
+                    shooterTimer.reset();
+                    shooterState = ShooterState.FEED;
+                }
+                break;
+
+            // Apply −0.01 power for 100 ms to stop spin before next cycle
+            case POST_FOURTH_BRAKE:
+                if (shooterTimer.milliseconds() >= BRAKE_MS) {
+                    launcher.setPower(0);
+                    leftFeeder.setPower(0);
+                    rightFeeder.setPower(0);
+                    shooterState = ShooterState.SPIN_DOWN;
+                    shooterTimer.reset();
                 }
                 break;
 
@@ -202,6 +258,7 @@ public class MeetZeroTeleOp extends LinearOpMode {
             continuousRequested = false;
             burstShots = 0;
             firstShotDone = false;
+            delayedFourthEnabled = false;
             launcher.setPower(0);
             leftFeeder.setPower(0);
             rightFeeder.setPower(0);
