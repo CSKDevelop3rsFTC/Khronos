@@ -6,130 +6,152 @@ import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.CRServo;
+import com.qualcomm.robotcore.hardware.VoltageSensor;
 
 @TeleOp(name="MeetZeroTeleOp", group="Robot")
 public class MeetZeroTeleOp extends LinearOpMode {
 
-    //drive train motors
-    public DcMotor frontLeftDrive = null;
-    public DcMotor frontRightDrive = null;
-    public DcMotor backLeftDrive = null;
-    public DcMotor backRightDrive = null;
-    public CRServo leftFeeder = null;
-    public CRServo rightFeeder = null;
-    public DcMotorEx launcher = null;
+    // Drive train motors
+    private DcMotor frontLeftDrive, frontRightDrive, backLeftDrive, backRightDrive;
+    private CRServo leftFeeder, rightFeeder;
+    private DcMotorEx launcher;
 
-    // --- Shooter params (same behavior as before) ---
-    public double  mshooterSpeed = 0.63;                 // initial launcher power
-    public double  sshooterSpeed = -1;
-    public long    shotSpaceTime = (long) (0.23 * 1000); // feeder ON per shot
-    public long    singleShotTime = (long) (0.24 * 1000);// recovery BEFORE 2nd shot
+    // Servo constants (unchanged)
+    private static final double SERVO_FEED_POWER = -1.0;
+    private static final long SHOT_SPACE_MS = (long)(0.3 * 1000);
+    private static final long INTERSHOT_MS  = (long)(0.5 * 1000);
 
-    // --- NEW: post-first-shot boost and shorter recovery for subsequent shots ---
-    public double  postFirstPower = 0.86;                // boost power after 1st shot
-    public long    singleShotTimeAfterFirst = (long)(0.2 * 1000); // shorter recovery after 1st
-    private boolean firstShotDone = false;
+    // Launcher baseline values (at 12.3V)
+    private static final double BASE_POWER_1  = 0.66; // first shot
+    private static final double BASE_POWER_2  = 0.75; // second shot (tunable midpoint)
+    private static final double BASE_POWER_34 = 0.73; // shots 3 and 4
 
-    public long    chargeUpTime = (long) (1.6 * 1000);
-    public boolean shootTimer = false;
+    // Charge-up timing
+    private static final long CHARGE_UP_MS = (long)(1.6 * 1000);
 
-    // NEW: extra-shot wait time and flag
-    private static final long FOURTH_DELAY_MS = 200;     // 1 second pause before 4th
-    private static final long BRAKE_MS = 400;             // 100 ms reverse brake
-    private boolean delayedFourthEnabled = false;         // only for 3-shot burst
+    // NEW: reverse brake after 4th shot
+    private static final long POST_BURST_BRAKE_MS = 300;
 
-    private enum ShooterState {
-        IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, COOLDOWN,
-        // NEW states
-        DELAY_BEFORE_FOURTH,
-        POST_FOURTH_BRAKE
-    }
+    // State machine
+    private enum ShooterState { IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, COOLDOWN, REVERSE_BRAKE }
     private ShooterState shooterState = ShooterState.IDLE;
+
     private com.qualcomm.robotcore.util.ElapsedTime shooterTimer =
             new com.qualcomm.robotcore.util.ElapsedTime();
     private com.qualcomm.robotcore.util.ElapsedTime cooldownTimer =
             new com.qualcomm.robotcore.util.ElapsedTime();
 
-    // Edge detection and mode
-    private boolean prevTriggerHeld = false;
+    private boolean prevTrigger = false;
     private boolean prevBumper = false;
-    private boolean continuousRequested = false;  // left trigger hold
-    private int burstShots = 0;                   // for 3-shot burst
+    private boolean continuousRequested = false;
+    private int burstShots = 0;
 
-    public void initialize() {
+    private boolean firstShotDone = false;
+    private int shotsInCycle = 0; // counts shots fired since spin-up (1,2,3,...)
+
+    // Voltage scaling parameters
+    private static final double NOMINAL_VOLTAGE = 12.3;
+    private static final double VOLTAGE_SCALE = 0.06; // 10% change per ±0.5V deviation
+
+    private double getVoltage() {
+        double min = Double.POSITIVE_INFINITY;
+        for (VoltageSensor s : hardwareMap.getAll(VoltageSensor.class)) {
+            double v = s.getVoltage();
+            if (v > 0) min = Math.min(min, v);
+        }
+        return (min == Double.POSITIVE_INFINITY) ? NOMINAL_VOLTAGE : min;
+    }
+
+    private double scalePower(double base, double voltage) {
+        double diff = voltage - NOMINAL_VOLTAGE;
+        double scale = 1.0 - (diff * (VOLTAGE_SCALE / 0.5)); // ±10% per 0.5V diff
+        return Math.max(0, Math.min(1, base * scale));
+    }
+
+    @Override
+    public void runOpMode() {
+        initialize();
+        waitForStart();
+
+        while (opModeIsActive()) {
+            driveController();
+            shooter();
+            sleep(20);
+        }
+    }
+
+    private void initialize() {
         frontLeftDrive  = hardwareMap.get(DcMotor.class, "frontLeftDrive");
         frontRightDrive = hardwareMap.get(DcMotor.class, "frontRightDrive");
         backLeftDrive   = hardwareMap.get(DcMotor.class, "backLeftDrive");
         backRightDrive  = hardwareMap.get(DcMotor.class, "backRightDrive");
-
-        frontLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
-        backLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
-        frontRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
-        backRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
 
         launcher    = hardwareMap.get(DcMotorEx.class, "launcher");
         leftFeeder  = hardwareMap.get(CRServo.class, "left_feeder");
         rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
         rightFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
+
+        frontLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
+        backLeftDrive.setDirection(DcMotorSimple.Direction.FORWARD);
+        frontRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
+        backRightDrive.setDirection(DcMotorSimple.Direction.REVERSE);
+
         leftFeeder.setPower(0);
         rightFeeder.setPower(0);
+        launcher.setPower(0);
     }
 
-    public void driveMovement(double driveSpeed) {
-        double horizontal = gamepad1.left_stick_x;
-        double vertical   = gamepad1.left_stick_y;
-        double pivot      = -gamepad1.right_stick_x * 0.5;
+    private void driveController() {
+        double speed = (gamepad1.right_trigger > 0) ? 0.5 : 1.0;
+        double x = gamepad1.left_stick_x;
+        double y = gamepad1.left_stick_y;
+        double pivot = -gamepad1.right_stick_x * 0.5;
 
-        frontRightDrive.setPower(((vertical + horizontal) - pivot) * driveSpeed);
-        frontLeftDrive.setPower(((vertical - horizontal) + pivot) * driveSpeed);
-        backRightDrive.setPower(((vertical - horizontal) - pivot) * driveSpeed);
-        backLeftDrive.setPower(((vertical + horizontal) + pivot) * driveSpeed);
+        frontLeftDrive.setPower(((y - x) + pivot) * speed);
+        backLeftDrive.setPower(((y + x) + pivot) * speed);
+        frontRightDrive.setPower(((y + x) - pivot) * speed);
+        backRightDrive.setPower(((y - x) - pivot) * speed);
     }
 
-    public void driveController() {
-        if (gamepad1.right_trigger > 0) driveMovement(0.5);
-        else                             driveMovement(1.0);
-    }
+    private void shooter() {
+        boolean trigger = gamepad1.left_trigger > 0.15;
+        boolean bumper = gamepad1.left_bumper;
+        double voltage = getVoltage();
 
-    public void shooter() {
-        boolean triggerHeld   = gamepad1.left_trigger > 0.15;
-        boolean bumperPressed = gamepad1.left_bumper;
+        // Precompute scaled stage powers
+        double p1  = scalePower(BASE_POWER_1,  voltage);
+        double p2  = scalePower(BASE_POWER_2,  voltage);
+        double p34 = scalePower(BASE_POWER_34, voltage);
 
-        // Trigger: start/stop continuous
-        if (triggerHeld && !prevTriggerHeld) {
+        // Start/stop via trigger (continuous)
+        if (trigger && !prevTrigger) {
             continuousRequested = true;
-            if (shooterState == ShooterState.IDLE || shooterState == ShooterState.SPIN_DOWN) {
-                firstShotDone = false;                      // reset boost flag
-                launcher.setPower(mshooterSpeed);
-                shooterState = ShooterState.SPIN_UP;
-                shooterTimer.reset();
-            }
+            firstShotDone = false;
+            shotsInCycle = 0;
+            launcher.setPower(p1);
+            shooterState = ShooterState.SPIN_UP;
+            shooterTimer.reset();
         }
-        if (!triggerHeld && prevTriggerHeld) {
+        if (!trigger && prevTrigger) {
             continuousRequested = false;
-            if (shooterState == ShooterState.SPIN_UP ||
-                    shooterState == ShooterState.FEED ||
-                    shooterState == ShooterState.INTERSHOT) {
-                shooterState = ShooterState.SPIN_DOWN;
-                shooterTimer.reset();
-            }
+            shooterState = ShooterState.SPIN_DOWN;
         }
-        prevTriggerHeld = triggerHeld;
+        prevTrigger = trigger;
 
-        // Bumper: 3-shot burst (+ delayed 4th after 1s)
-        if (bumperPressed && !prevBumper) {
-            if (shooterState != ShooterState.COOLDOWN && !shootTimer) {
+        // Left bumper: 4-shot burst
+        if (bumper && !prevBumper) {
+            if (shooterState != ShooterState.COOLDOWN) {
                 continuousRequested = false;
-                burstShots = 3;
-                delayedFourthEnabled = true;               // arm the delayed 4th
-                firstShotDone = false;                      // reset boost flag
-                launcher.setPower(mshooterSpeed);
+                burstShots = 4;
+                firstShotDone = false;
+                shotsInCycle = 0;
+                launcher.setPower(p1);
                 shooterState = ShooterState.SPIN_UP;
                 shooterTimer.reset();
             }
         }
-        prevBumper = bumperPressed;
+        prevBumper = bumper;
 
         switch (shooterState) {
             case IDLE:
@@ -139,115 +161,71 @@ public class MeetZeroTeleOp extends LinearOpMode {
                 break;
 
             case SPIN_UP:
-                if (shooterTimer.milliseconds() >= chargeUpTime) {
-                    leftFeeder.setPower(sshooterSpeed);
-                    rightFeeder.setPower(sshooterSpeed);
+                if (shooterTimer.milliseconds() >= CHARGE_UP_MS) {
+                    leftFeeder.setPower(SERVO_FEED_POWER);
+                    rightFeeder.setPower(SERVO_FEED_POWER);
                     shooterTimer.reset();
                     shooterState = ShooterState.FEED;
                 }
                 break;
 
             case FEED:
-                if (shooterTimer.milliseconds() >= shotSpaceTime) {
-                    // Shot just completed
+                if (shooterTimer.milliseconds() >= SHOT_SPACE_MS) {
+                    // one shot just completed
                     leftFeeder.setPower(0);
                     rightFeeder.setPower(0);
 
-                    // After the FIRST completed shot, rapidly boost to higher power
-                    if (!firstShotDone) {
+                    shotsInCycle++;                 // 1,2,3,...
+
+                    // choose next launcher setpoint based on shot index
+                    if (shotsInCycle == 1) {
                         firstShotDone = true;
-                        launcher.setPower(postFirstPower);   // immediate ramp
+                        launcher.setPower(p2);       // after first shot
+                    } else if (shotsInCycle >= 2) {
+                        launcher.setPower(p34);      // from second onward
                     }
 
-                    // If we're still in a burst (first three), decrement and proceed
-                    if (!continuousRequested && burstShots > 0) {
-                        burstShots--;
-                        shooterTimer.reset();
+                    if (continuousRequested) {
                         shooterState = ShooterState.INTERSHOT;
-                        break;
-                    }
-
-                    // If this was the delayed 4th shot: apply a brief reverse brake
-                    if (!continuousRequested && !delayedFourthEnabled && burstShots == 0 && firstShotDone) {
-                        launcher.setPower(-0.01);            // tiny reverse to decelerate
                         shooterTimer.reset();
-                        shooterState = ShooterState.POST_FOURTH_BRAKE;
-                        break;
-                    }
-
-                    // Otherwise continue normal intershot handling
-                    shooterTimer.reset();
-                    shooterState = ShooterState.INTERSHOT;
-                }
-                break;
-
-            case INTERSHOT:
-                // Use shorter recovery AFTER first shot
-                long needed = firstShotDone ? singleShotTimeAfterFirst : singleShotTime;
-
-                if (shooterTimer.milliseconds() >= needed) {
-                    boolean doMoreContinuous = continuousRequested;
-                    boolean doMoreBurst      = (!continuousRequested && burstShots > 0);
-
-                    if (doMoreContinuous || doMoreBurst) {
-                        leftFeeder.setPower(sshooterSpeed);
-                        rightFeeder.setPower(sshooterSpeed);
-                        shooterTimer.reset();
-                        shooterState = ShooterState.FEED;
                     } else {
-                        // No more burst shots, but we owe a delayed fourth
-                        if (!continuousRequested && delayedFourthEnabled) {
-                            shooterState = ShooterState.DELAY_BEFORE_FOURTH;
+                        if (--burstShots > 0) {
+                            shooterState = ShooterState.INTERSHOT;
                             shooterTimer.reset();
                         } else {
-                            shooterState = ShooterState.SPIN_DOWN;
+                            // Immediately reverse for 300ms after the 4th shot
+                            launcher.setPower(-1.0);
                             shooterTimer.reset();
+                            shooterState = ShooterState.REVERSE_BRAKE;
                         }
                     }
                 }
                 break;
 
-            // Wait 1 second, then fire a single final shot
-            case DELAY_BEFORE_FOURTH:
-                // keep launcher spinning at current power during the pause
-                if (shooterTimer.milliseconds() >= FOURTH_DELAY_MS) {
-                    // feed one last time
-                    leftFeeder.setPower(sshooterSpeed);
-                    rightFeeder.setPower(sshooterSpeed);
-                    delayedFourthEnabled = false; // only once
-                    shooterTimer.reset();
+            case INTERSHOT:
+                if (shooterTimer.milliseconds() >= INTERSHOT_MS) {
+                    leftFeeder.setPower(SERVO_FEED_POWER);
+                    rightFeeder.setPower(SERVO_FEED_POWER);
                     shooterState = ShooterState.FEED;
+                    shooterTimer.reset();
                 }
                 break;
 
-            // Apply −0.01 power for 100 ms to stop spin before next cycle
-            case POST_FOURTH_BRAKE:
-                if (shooterTimer.milliseconds() >= BRAKE_MS) {
+            case REVERSE_BRAKE:
+                if (shooterTimer.milliseconds() >= POST_BURST_BRAKE_MS) {
                     launcher.setPower(0);
-                    leftFeeder.setPower(0);
-                    rightFeeder.setPower(0);
                     shooterState = ShooterState.SPIN_DOWN;
-                    shooterTimer.reset();
                 }
                 break;
 
             case SPIN_DOWN:
                 launcher.setPower(0);
-                leftFeeder.setPower(0);
-                rightFeeder.setPower(0);
-
-                if (continuousRequested) {
-                    shooterState = ShooterState.IDLE;
-                } else {
-                    shootTimer = true;
-                    cooldownTimer.reset();
-                    shooterState = ShooterState.COOLDOWN;
-                }
+                shooterState = ShooterState.COOLDOWN;
+                cooldownTimer.reset();
                 break;
 
             case COOLDOWN:
-                if (cooldownTimer.milliseconds() >= 3500) {
-                    shootTimer = false;
+                if (cooldownTimer.milliseconds() >= 3000) {
                     shooterState = ShooterState.IDLE;
                 }
                 break;
@@ -255,32 +233,17 @@ public class MeetZeroTeleOp extends LinearOpMode {
 
         // Hard cancel
         if (gamepad1.y) {
-            continuousRequested = false;
-            burstShots = 0;
-            firstShotDone = false;
-            delayedFourthEnabled = false;
             launcher.setPower(0);
             leftFeeder.setPower(0);
             rightFeeder.setPower(0);
-            shootTimer = false;
             shooterState = ShooterState.IDLE;
+            shotsInCycle = 0;
         }
-    }
 
-    public void shotCooldown() {
-        shootTimer = true;
-        cooldownTimer.reset();
-        shooterState = ShooterState.COOLDOWN;
-    }
-
-    @Override
-    public void runOpMode() {
-        initialize();
-        waitForStart();
-        while (opModeIsActive()) {
-            driveController();
-            shooter();
-            sleep(50);
-        }
+        telemetry.addData("Voltage", "%.2f V", voltage);
+        telemetry.addData("Launcher Pwr (p1,p2,p34)", "%.2f, %.2f, %.2f", p1, p2, p34);
+        telemetry.addData("Shot#", shotsInCycle);
+        telemetry.addData("State", shooterState);
+        telemetry.update();
     }
 }
