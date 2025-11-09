@@ -23,7 +23,7 @@ public class goalPathB extends OpMode {
     private Follower follower;
     private Timer pathTimer;
     private int pathState;
-    private PathChain forward;
+    private PathChain forward, park;
     private PathChain finish;
 
     // Push legs
@@ -42,9 +42,9 @@ public class goalPathB extends OpMode {
     private static final long INTERSHOT_MS  = (long)(0.5 * 1000);
 
     // Launcher baseline values (at 12.3V)
-    private static final double BASE_POWER_1  = 0.66; // first shot
-    private static final double BASE_POWER_2  = 0.75; // second shot (tunable midpoint)
-    private static final double BASE_POWER_34 = 0.73; // shots 3 and 4
+    private static final double BASE_POWER_1  = 0.66; // 66 first shot
+    private static final double BASE_POWER_2  = 0.75; // 75 second shot (tunable midpoint)
+    private static final double BASE_POWER_34 = 0.73; // 73 shots 3 and 4
 
     // Charge-up timing
     private static final long CHARGE_UP_MS = (long)(1.6 * 1000);
@@ -74,10 +74,12 @@ public class goalPathB extends OpMode {
     private com.qualcomm.robotcore.util.ElapsedTime cooldownTimer =
             new com.qualcomm.robotcore.util.ElapsedTime();
     // Poses (yours)
-    private final Pose pos1   = new Pose(120, 48, Math.toRadians(45));
+    private final Pose pos1   = new Pose(123, 51, Math.toRadians(45));
+    private final Pose pos2 = new Pose(108,36,Math.toRadians(45));
    // private final Pose pos2 = new Pose (72, -34, Math.toRadians(0));
     // push row closest to zone
-    private final Pose pos2 = new Pose (48, -22, Math.toRadians(45)); //CORRECT
+    //private final Pose pos2 = new Pose (48, -22, Math.toRadians(45)); //CORRECT
+    private final Pose pos3 = new Pose(96, 48, Math.toRadians(45));
     // private final Pose push0  = new Pose (24, -57, Math.toRadians(60)); // DISABLED
     // private final Pose push1  = new Pose (33, -48, Math.toRadians(45)); // DISABLED
 
@@ -118,6 +120,10 @@ public class goalPathB extends OpMode {
         forward = follower.pathBuilder()
                 .addPath(new BezierLine(pos1, pos2))
                 .setLinearHeadingInterpolation(pos1.getHeading(), pos2.getHeading())
+                .build();
+        park = follower.pathBuilder()
+                .addPath(new BezierLine(pos2,pos3))
+                .setLinearHeadingInterpolation(pos2.getHeading(), pos3.getHeading())
                 .build();
 
     }
@@ -236,6 +242,11 @@ public class goalPathB extends OpMode {
     private void pathUpdate() {
         switch (pathState) {
             case 0:
+                follower.followPath(forward, true);
+                setPathState(1); // settle then push
+                break;
+            case 1: // Run forward (start -> mid)
+
                 if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
                     if (!shotRequested) {
                         requestBurst4();      // fire AFTER finish is fully done
@@ -245,23 +256,22 @@ public class goalPathB extends OpMode {
                     if (shooterState == ShooterState.DONE
                             || shooterState == ShooterState.IDLE
                             || shooterState == ShooterState.COOLDOWN) {
-                        setPathState(1); // settle then push
+                        setPathState(2);
                     }
                 }
-                break;
-            case 1: // Run forward (start -> mid)
-                follower.followPath(forward, true);
-                setPathState(2);
-                break;
 
-            case 2: // leg 1 active
+                break;
+            case 2:
+                follower.followPath(park,true);
+                setPathState(3);
+            case 3: // leg 1 active
                 if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
-                    leg1Finished = true;
+                    //leg1Finished = true;
                     setPathState(3); // jump straight to done
                 }
                 break;
 
-            case 3: // all legs done
+            case 4: // all legs done
                 // handled in loop() for stop
                 break;
         }
