@@ -42,9 +42,9 @@ public class goalPathB extends OpMode {
     private static final long INTERSHOT_MS  = (long)(0.5 * 1000);
 
     // Launcher baseline values (at 12.3V)
-    private static final double BASE_POWER_1  = 0.66; // 66 first shot
-    private static final double BASE_POWER_2  = 0.75; // 75 second shot (tunable midpoint)
-    private static final double BASE_POWER_34 = 0.73; // 73 shots 3 and 4
+    private static final double BASE_POWER_1  = 0.68; // 66 first shot
+    private static final double BASE_POWER_2  = 0.77; // 75 second shot (tunable midpoint)
+    private static final double BASE_POWER_34 = 0.74; // 73 shots 3 and 4
 
     // Charge-up timing
     private static final long CHARGE_UP_MS = (long)(1.6 * 1000);
@@ -59,8 +59,8 @@ public class goalPathB extends OpMode {
     private boolean continuousRequested = false;
     private boolean burstRequested = false;
 
-    private static final double NOMINAL_VOLTAGE = 12.3;
-    private static final double VOLTAGE_SCALE = 0.06;
+    private static final double NOMINAL_VOLTAGE = 12.6;
+    private static final double VOLTAGE_SCALE = 0.04;
 
     // Spin-up before first feed
     private long    chargeUpTimeMs   = 1600;
@@ -76,7 +76,7 @@ public class goalPathB extends OpMode {
     // Poses (yours)
     private final Pose pos1   = new Pose(123, 51, Math.toRadians(45));
     private final Pose pos2 = new Pose(108,36,Math.toRadians(45));
-   // private final Pose pos2 = new Pose (72, -34, Math.toRadians(0));
+    // private final Pose pos2 = new Pose (72, -34, Math.toRadians(0));
     // push row closest to zone
     //private final Pose pos2 = new Pose (48, -22, Math.toRadians(45)); //CORRECT
     private final Pose pos3 = new Pose(96, 48, Math.toRadians(45));

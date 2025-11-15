@@ -1,13 +1,10 @@
 package org.firstinspires.ftc.teamcode.paths;
 
-import static org.firstinspires.ftc.robotcore.external.BlocksOpModeCompanion.telemetry;
-
 import com.pedropathing.follower.Follower;
 import com.pedropathing.geometry.BezierLine;
 import com.pedropathing.geometry.Pose;
 import com.pedropathing.paths.PathChain;
 import com.pedropathing.util.Timer;
-
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.hardware.CRServo;
@@ -17,6 +14,7 @@ import com.qualcomm.robotcore.hardware.VoltageSensor;
 import com.qualcomm.robotcore.util.ElapsedTime;
 
 import org.firstinspires.ftc.teamcode.pedroPathing.Constants;
+import org.firstinspires.ftc.teamcode.teleop.MeetZeroTeleOp;
 
 @Autonomous(name = "pathRed", group = "Autonomous")
 public class pathRed extends OpMode {
@@ -25,52 +23,70 @@ public class pathRed extends OpMode {
     private Follower follower;
     private Timer pathTimer;
     private int pathState;
-    private PathChain forward;
+    private PathChain forward, park;
     private PathChain finish;
 
     // Push legs
     private PathChain pushLeg1; // endPose -> balls0
+    // private PathChain pushLeg2; // balls0 -> push0  (DISABLED)
+    // private PathChain pushLeg3; // push0  -> push1  (DISABLED)
 
     // Shooter hardware
     private CRServo leftFeeder, rightFeeder;
     private DcMotorEx launcher;
 
-    // TeleOp shooter constants
-    private static final double SERVO_FEED_POWER    = -1.0;
-    private static final long   SHOT_SPACE_MS       = (long)(0.3 * 1000);
-    private static final long   INTERSHOT_MS        = (long)(0.5 * 1000);
-    private static final long   CHARGE_UP_MS        = (long)(1.6 * 1000);
-    private static final long   POST_BURST_BRAKE_MS = 300;
-    private static final long   COOLDOWN_MS         = 3000;
+    // === Match TeleOp defaults (editable) ===
+    // Servo constants (unchanged)
+    private static final double SERVO_FEED_POWER = -1.0;
+    private static final long SHOT_SPACE_MS = (long)(0.3 * 1000);
+    private static final long INTERSHOT_MS  = (long)(0.4 * 1000);
 
-    // Launcher baseline powers at 12.3V
-    private static final double BASE_POWER_1  = 0.66;
-    private static final double BASE_POWER_2  = 0.75;
-    private static final double BASE_POWER_34 = 0.73;
+    // Launcher baseline values (at 12.3V)
+    private static final double BASE_POWER_1  = 0.96; // 66 first shot
+    private static final double BASE_POWER_2  = 0.97; // 75 second shot (tunable midpoint)
+    private static final double BASE_POWER_34 = 0.94; // 73 shots 3 and 4
 
-    // Voltage scaling
-    private static final double NOMINAL_VOLTAGE = 12.3;
-    private static final double VOLTAGE_SCALE   = 0.06; // 10% per ±0.5V
+    // Charge-up timing
+    private static final long CHARGE_UP_MS = (long)(1.25 * 1000);
+
+    // NEW: reverse brake after 4th shot
+    private static final long POST_BURST_BRAKE_MS = 300;
+
+    private int burstShots = 0;
+
+    private boolean firstShotDone = false;
+    private int shotsInCycle = 0;
+    private boolean continuousRequested = false;
+    private boolean burstRequested = false;
+
+    private static final double NOMINAL_VOLTAGE = 12.6;
+    private static final double VOLTAGE_SCALE = 0.05;
+
+    // Spin-up before first feed
+    private long    chargeUpTimeMs   = 1250;
 
     // Shooter FSM
-    private enum ShooterState { IDLE, SPIN_UP, FEED, INTERSHOT, REVERSE_BRAKE, SPIN_DOWN, COOLDOWN }
+    private enum ShooterState { IDLE, SPIN_UP, FEED, INTERSHOT, SPIN_DOWN, DONE, COOLDOWN, REVERSE_BRAKE }
     private ShooterState shooterState = ShooterState.IDLE;
-
-    private final ElapsedTime shooterTimer  = new ElapsedTime();
-    private final ElapsedTime cooldownTimer = new ElapsedTime();
-
-    private int  burstShots     = 0;   // remaining in current burst
-    private int  shotsInCycle   = 0;   // 1,2,3,4...
-    private boolean shotRequested  = false; // guard to request once
-    private boolean burstTriggered = false; // for telemetry
-
+    private int shotsRemaining = 0;
+    private com.qualcomm.robotcore.util.ElapsedTime shooterTimer =
+            new com.qualcomm.robotcore.util.ElapsedTime();
+    private com.qualcomm.robotcore.util.ElapsedTime cooldownTimer =
+            new com.qualcomm.robotcore.util.ElapsedTime();
     // Poses
-    private final Pose startPose = new Pose(12,  -18, Math.toRadians(0));
-    private final Pose midPose   = new Pose(108, -18, Math.toRadians(-48));
-    private final Pose endPose   = new Pose(123, -45, Math.toRadians(-48));
+    private final Pose pos1   = new Pose(12, -18, Math.toRadians(0));
+    private final Pose pos2 = new Pose(19.6,-11.2,Math.toRadians(338));
 
-    // push row closest to zone
-    private final Pose balls0    = new Pose(50, 40, Math.toRadians(-48));
+    private final Pose pos3 = new Pose(40, -20, Math.toRadians(338));
+
+    // Guards
+    private boolean burstTriggered = false; // set true when we requestBurst3()
+    private boolean shotRequested  = false; // "finish is done, shots requested"
+
+    // Push sequence flags
+    private boolean leg1Started = false, leg1Finished = false;
+    // private boolean leg2Started = false, leg2Finished = false; // DISABLED
+    // private boolean leg3Started = false, leg3Finished = false; // DISABLED
 
     // Wait a beat between shooting and pushing
     private final long POST_SHOOT_SETTLE_MS = 300;
@@ -80,7 +96,6 @@ public class pathRed extends OpMode {
     private final long AUTO_TIMEOUT_MS = 20000; // safety stop after 20 s
     private final ElapsedTime matchTimer = new ElapsedTime();
 
-    // Voltage helpers
     private double getVoltage() {
         double min = Double.POSITIVE_INFINITY;
         for (VoltageSensor s : hardwareMap.getAll(VoltageSensor.class)) {
@@ -89,55 +104,47 @@ public class pathRed extends OpMode {
         }
         return (min == Double.POSITIVE_INFINITY) ? NOMINAL_VOLTAGE : min;
     }
+
     private double scalePower(double base, double voltage) {
-        double diff  = voltage - NOMINAL_VOLTAGE;
-        double scale = 1.0 - (diff * (VOLTAGE_SCALE / 0.5)); // ±10% per 0.5V
+        double diff = voltage - NOMINAL_VOLTAGE;
+        double scale = 1.0 - (diff * (VOLTAGE_SCALE / 0.5)); // Â±10% per 0.5V diff
         return Math.max(0, Math.min(1, base * scale));
     }
 
-    // Build paths
+    // Build first path (shooting run): forward then finish. No callbacks here.
     private void buildPath() {
         forward = follower.pathBuilder()
-                .addPath(new BezierLine(startPose, midPose))
-                .setLinearHeadingInterpolation(startPose.getHeading(), midPose.getHeading())
+                .addPath(new BezierLine(pos1, pos2))
+                .setLinearHeadingInterpolation(pos1.getHeading(), pos2.getHeading())
+                .build();
+        park = follower.pathBuilder()
+                .addPath(new BezierLine(pos2,pos3))
+                .setLinearHeadingInterpolation(pos2.getHeading(), pos3.getHeading())
                 .build();
 
-        finish = follower.pathBuilder()
-                .addPath(new BezierLine(midPose, endPose))
-                .setLinearHeadingInterpolation(midPose.getHeading(), endPose.getHeading())
-                .build();
-    }
-    private void buildPushLegs() {
-        double h45 = Math.toRadians(-48);
-        pushLeg1 = follower.pathBuilder()
-                .addPath(new BezierLine(endPose, balls0))
-                .setLinearHeadingInterpolation(endPose.getHeading(), h45)
-                .build();
     }
 
-    // Shooter trigger (4-shot burst once)
+    // Shooter helpers
     private void requestBurst4() {
-        if (shotRequested) return;
+        if (burstRequested) return;
         if (shooterState != ShooterState.IDLE) return;
 
-        shotRequested  = true;
-        burstTriggered = true;
-        burstShots     = 4;
-        shotsInCycle   = 0;
+        burstRequested = true;
+        burstShots = 4;
+        shotsInCycle = 0;
+        double voltage = getVoltage();
 
         double p1 = scalePower(BASE_POWER_1, getVoltage());
+        double p2  = scalePower(BASE_POWER_2,  voltage);
+        double p34 = scalePower(BASE_POWER_34, voltage);
         launcher.setPower(p1);
         shooterTimer.reset();
         shooterState = ShooterState.SPIN_UP;
     }
 
-    // Shooter update (TeleOp parity)
-    private void updateShooter() {
-        double v   = getVoltage();
-        double p1  = scalePower(BASE_POWER_1,  v);
-        double p2  = scalePower(BASE_POWER_2,  v);
-        double p34 = scalePower(BASE_POWER_34, v);
 
+
+    private void updateShooter() {
         switch (shooterState) {
             case IDLE:
                 leftFeeder.setPower(0);
@@ -156,27 +163,37 @@ public class pathRed extends OpMode {
 
             case FEED:
                 if (shooterTimer.milliseconds() >= SHOT_SPACE_MS) {
-                    // one shot completed
+                    // one shot just completed
+                    double voltage = getVoltage();
+                    double p1  = scalePower(BASE_POWER_1,  voltage);
+                    double p2  = scalePower(BASE_POWER_2,  voltage);
+                    double p34 = scalePower(BASE_POWER_34, voltage);
                     leftFeeder.setPower(0);
                     rightFeeder.setPower(0);
 
-                    shotsInCycle++; // 1,2,3,4
+                    shotsInCycle++;                 // 1,2,3,...
 
-                    // stage powers
+                    // choose next launcher setpoint based on shot index
                     if (shotsInCycle == 1) {
-                        launcher.setPower(p2);
-                    } else {
-                        launcher.setPower(p34);
+                        firstShotDone = true;
+                        launcher.setPower(p2);       // after first shot
+                    } else if (shotsInCycle >= 2) {
+                        launcher.setPower(p34);      // from second onward
                     }
 
-                    if (--burstShots > 0) {
-                        shooterTimer.reset();
+                    if (continuousRequested) {
                         shooterState = ShooterState.INTERSHOT;
-                    } else {
-                        // Reverse brake after 4th
-                        launcher.setPower(-1.0);
                         shooterTimer.reset();
-                        shooterState = ShooterState.REVERSE_BRAKE;
+                    } else {
+                        if (--burstShots > 0) {
+                            shooterState = ShooterState.INTERSHOT;
+                            shooterTimer.reset();
+                        } else {
+                            // Immediately reverse for 300ms after the 4th shot
+                            launcher.setPower(-1.0);
+                            shooterTimer.reset();
+                            shooterState = ShooterState.REVERSE_BRAKE;
+                        }
                     }
                 }
                 break;
@@ -185,8 +202,8 @@ public class pathRed extends OpMode {
                 if (shooterTimer.milliseconds() >= INTERSHOT_MS) {
                     leftFeeder.setPower(SERVO_FEED_POWER);
                     rightFeeder.setPower(SERVO_FEED_POWER);
-                    shooterTimer.reset();
                     shooterState = ShooterState.FEED;
+                    shooterTimer.reset();
                 }
                 break;
 
@@ -204,67 +221,54 @@ public class pathRed extends OpMode {
                 break;
 
             case COOLDOWN:
-                if (cooldownTimer.milliseconds() >= COOLDOWN_MS) {
+                if (cooldownTimer.milliseconds() >= 3000) {
                     shooterState = ShooterState.IDLE;
                 }
                 break;
         }
 
-        telemetry.addData("Voltage", "%.2f V", v);
-        telemetry.addData("Launcher Pwr (p1,p2,p34)", "%.2f, %.2f, %.2f", p1, p2, p34);
-        telemetry.addData("ShotsInCycle", shotsInCycle);
-        telemetry.addData("BurstRemaining", burstShots);
-        telemetry.addData("ShooterState", shooterState);
+        telemetry.addData("shooter state", shooterState);
+        telemetry.addData("shots remaining", shotsRemaining);
+        telemetry.addData("first shot done", firstShotDone);
     }
 
-    // Path state machine (shoot after finish, then push)
-    private boolean leg1Started = false, leg1Finished = false;
-
+    // Path state
     private void setPathState(int s) { pathState = s; pathTimer.resetTimer(); }
 
     private void pathUpdate() {
         switch (pathState) {
-            case 0: // Run forward (start -> mid)
+            case 0:
                 follower.followPath(forward, true);
-                setPathState(1);
+                setPathState(1); // settle then push
                 break;
+            case 1: // Run forward (start -> mid)
 
-            case 1: // Wait for forward to finish, then run finish (mid -> end)
                 if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
-                    follower.followPath(finish, true);
-                    setPathState(2);
-                }
-                break;
-
-            case 2: // At goal: shoot once, then wait for shooter to finish
-                if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
-                    requestBurst4();
-                    if (shooterState == ShooterState.IDLE) {
-                        settleTimer.reset();
-                        setPathState(3);
+                    if (!shotRequested) {
+                        requestBurst4();      // fire AFTER finish is fully done
+                        shotRequested = true; // guard
                     }
-                }
-                break;
-
-            case 3: // Settle window before push
-                if (settleTimer.milliseconds() >= POST_SHOOT_SETTLE_MS) {
-                    if (!leg1Started) {
-                        buildPushLegs();
-                        follower.followPath(pushLeg1, true);
-                        leg1Started = true;
+                    // move on once shooter finishes or is idle (e.g., if no shots)
+                    if (shooterState == ShooterState.DONE
+                            || shooterState == ShooterState.IDLE
+                            || shooterState == ShooterState.COOLDOWN) {
+                        setPathState(2);
                     }
-                    setPathState(4);
-                }
-                break;
 
-            case 4: // leg 1 active
+                }
+
+                break;
+            case 2:
+                follower.followPath(park,true);
+                setPathState(3);
+            case 3: // leg 1 active
                 if (follower.getCurrentTValue() >= 0.98 || !follower.isBusy()) {
-                    leg1Finished = true;
-                    setPathState(5); // done
+                    //leg1Finished = true;
+                    setPathState(3); // jump straight to done
                 }
                 break;
 
-            case 5: // all legs done
+            case 4: // all legs done
                 // handled in loop() for stop
                 break;
         }
@@ -275,7 +279,7 @@ public class pathRed extends OpMode {
     public void init() {
         pathTimer = new Timer();
         follower = Constants.createFollower(hardwareMap);
-        follower.setStartingPose(startPose);
+        follower.setStartingPose(pos1);
 
         launcher    = hardwareMap.get(DcMotorEx.class, "launcher");
         leftFeeder  = hardwareMap.get(CRServo.class,   "left_feeder");
@@ -287,17 +291,14 @@ public class pathRed extends OpMode {
 
         launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
 
-        buildPath();
+        buildPath(); // build forward + finish
     }
 
     @Override
     public void start() {
         matchTimer.reset();
-        shotRequested  = false;
         burstTriggered = false;
-        burstShots     = 0;
-        shotsInCycle   = 0;
-        shooterState   = ShooterState.IDLE;
+        shotRequested  = false;
 
         leg1Started = leg1Finished = false;
 
@@ -310,12 +311,14 @@ public class pathRed extends OpMode {
         pathUpdate();
         updateShooter();
 
+        // Auto end once all active legs finished and shooter is done (or idle)
         boolean allLegsDone = leg1Finished;
 
-        if (allLegsDone && shooterState == ShooterState.IDLE) {
+        if (allLegsDone && (shooterState == ShooterState.DONE || shooterState == ShooterState.IDLE)) {
             requestOpModeStop();
         }
 
+        // Safety timeout
         if (matchTimer.milliseconds() >= AUTO_TIMEOUT_MS) {
             launcher.setPower(0);
             leftFeeder.setPower(0);
