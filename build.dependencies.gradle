@@ -5,7 +5,7 @@ repositories {
     maven { url= "https://maven.pedropathing.com/" }
     maven { url = "https://mymaven.bylazar.com/releases" }
 }
-
+/**
 dependencies {
     implementation 'org.firstinspires.ftc:Inspection:10.3.0'
     implementation 'org.firstinspires.ftc:Blocks:10.3.0'
@@ -22,4 +22,26 @@ dependencies {
     implementation 'com.bylazar:fullpanels:1.0.2'
     implementation 'androidx.appcompat:appcompat:1.2.0'
 }
+**/
 
+dependencies {
+    implementation 'org.firstinspires.ftc:Inspection:11.0.0'
+    implementation 'org.firstinspires.ftc:Blocks:11.0.0'
+    implementation 'org.firstinspires.ftc:RobotCore:11.0.0'
+    implementation 'org.firstinspires.ftc:RobotServer:11.0.0'
+    implementation 'org.firstinspires.ftc:OnBotJava:11.0.0'
+    implementation 'org.firstinspires.ftc:Hardware:11.0.0'
+    implementation 'org.firstinspires.ftc:FtcCommon:11.0.0'
+    implementation 'org.firstinspires.ftc:Vision:11.0.0'
+
+    implementation 'androidx.appcompat:appcompat:1.7.1'
+
+    implementation 'com.acmerobotics.dashboard:dashboard:0.5.1'
+
+    implementation 'com.acmerobotics.roadrunner:core:0.5.6'
+
+
+    implementation "com.noahbres.jotai:jotai:1.0.2"
+
+
+}
