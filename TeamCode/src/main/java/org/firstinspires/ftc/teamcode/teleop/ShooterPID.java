@@ -18,7 +18,7 @@ public class ShooterPID {
     public static double P = 0.004;
     public static double I = 0.0;
     public static double D = 0.000;
-    public static double F = 0.00055;
+    public static double F = 0.00047;
 
     // "RPM" / velocity units, same as TARGET_VEL in newTuner
     public static double TARGET_VEL = 0.0;
@@ -119,10 +119,10 @@ public class ShooterPID {
 
         // only log if telemetry was actually set
         if (dashTel != null) {
-            dashTel.addData("Target vel", TARGET_VEL);
-            dashTel.addData("Actual vel", motorVel);
-            dashTel.addData("Power", power);
-            dashTel.addData("Voltage", voltage);
+            //dashTel.addData("Target vel", TARGET_VEL);
+            //dashTel.addData("Actual vel", motorVel);
+            //dashTel.addData("Power", power);
+            //dashTel.addData("Voltage", voltage);
             dashTel.update();
         }
     }

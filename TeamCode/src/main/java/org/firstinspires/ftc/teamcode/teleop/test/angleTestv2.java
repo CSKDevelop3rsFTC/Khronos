@@ -1,3 +1,4 @@
+/**
 package org.firstinspires.ftc.teamcode.teleop.test;
 
 import com.acmerobotics.dashboard.FtcDashboard;
@@ -26,7 +27,6 @@ import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.Position;
 import org.firstinspires.ftc.robotcore.external.navigation.YawPitchRollAngles;
-import org.firstinspires.ftc.teamcode.teleop.MasterTeleOp;
 import org.firstinspires.ftc.teamcode.teleop.ShooterPID;
 import org.firstinspires.ftc.vision.VisionPortal;
 import org.firstinspires.ftc.vision.apriltag.AprilTagDetection;
@@ -251,7 +251,7 @@ public class angleTestv2 extends OpMode {
         haveTagFieldAngle = false;
         tagFieldAngleDeg = 0.0;
 
-        stopper.setPosition(MasterTeleOp.transferConstants.GATE_CLOSED);
+        stopper.setPosition(transferConstants.GATE_CLOSED);
 
 
         integral = 0.0;
@@ -917,3 +917,4 @@ public class angleTestv2 extends OpMode {
         return deg;
     }
 }
+**/
