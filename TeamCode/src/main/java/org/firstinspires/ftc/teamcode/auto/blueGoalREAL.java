@@ -1,782 +1,947 @@
 package org.firstinspires.ftc.teamcode.auto;
 
 import com.pedropathing.follower.Follower;
+import com.pedropathing.geometry.BezierCurve;
 import com.pedropathing.geometry.BezierLine;
 import com.pedropathing.geometry.Pose;
 import com.pedropathing.paths.PathChain;
-import com.pedropathing.util.Timer;
+import com.pedropathing.paths.PathConstraints;
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
+import com.qualcomm.robotcore.hardware.CRServo;
+import com.qualcomm.robotcore.hardware.ColorRangeSensor;
 import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.NormalizedColorSensor;
+import com.qualcomm.robotcore.hardware.NormalizedRGBA;
 import com.qualcomm.robotcore.hardware.Servo;
-import com.qualcomm.robotcore.hardware.IMU;
+import com.qualcomm.robotcore.hardware.ServoImplEx;
 import com.qualcomm.robotcore.util.ElapsedTime;
 
+import org.firstinspires.ftc.robotcore.external.JavaUtil;
 import org.firstinspires.ftc.teamcode.pedropathing.Constants;
-import org.firstinspires.ftc.teamcode.teleop.meet3.Meet3TeleOpB;
 import org.firstinspires.ftc.teamcode.teleop.ShooterPID;
 
-@Autonomous(name = "blueGoalREAL", group = "Autonomous")
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * blue18 (long auto, turret kept simple)
+ *
+ * Updates in THIS version:
+ *  - Removed "must be at target RPM" gating before feeding (no WAIT_SPEED step).
+ *  - Constant shot settings: RPM=950, Hood=0.7 for ALL shots.
+ *  - FTC-safe enum at class scope.
+ *  - Turret: now uses TeleOp-style field-point tracking of the goal (TARGET_X/Y),
+ *    using Pedro odometry.
+ *  - Turret encoder mapping matches TeleOp: "intake2".
+ */
+@Autonomous(name = "blue15push", group = "Autonomous")
 public class blueGoalREAL extends OpMode {
 
-    // Pedro follower
-    private Follower follower;
-    private Timer pathTimer;
-    private int pathState;
+    // =========================
+    // FTC-safe shoot state enum
+    // =========================
+    private enum ShootState { SETTLE, PRE, FEED, DONE }
 
-    // Paths / PathChains
-    private PathChain preload, preintake1, intake1, shoot1,
-            preintake2, intake2, shoot2, preGate, gateOpen,
-            preintake3, intake3, shoot3,
-            preintake4, intake4, backup, intake5, shoot4,
-            parkPath;
+    // =========================
+    // Shooter settings (constant)
+    // =========================
+    private static final double AUTO_RPM = 1670;
+    private static final double AUTO_HOOD = 0.63; // servo pos 0..1
 
-    // Hardware
-    private DcMotor intakeMotor;
-    private DcMotor turretMotor;
-    private Servo kickerServo, stopperServo;
-    private IMU imu; // currently not used in auto, but kept if needed later
+    private static final double SECOND_RPM = 1685;
+    private static final double SECOND_HOOD = 0.63; // servo pos 0..1
 
-    // Shooter (two flywheel motors: f1M, f2M)
-    private ShooterPID shooter;
+    private static final double THIRD_SHOT_RPM = 1625;
+    private static final double THIRD_SHOT_HOOD = 0.65;
 
-    // Intake logical state (when not in transfer)
-    private boolean intakeNow = false;
+    private static final double FOURTH_SHOT_RPM = 1750;
+    private static final double FOURTH_SHOT_HOOD = 0.63;
 
-    // Transfer state machine
-    private boolean transferRunning = false;
-    private int transferStep = 0;
-    private final ElapsedTime transferTimer = new ElapsedTime();
+    private static final double LAST_SHOT_RPM = 1575;
+    private static final double LAST_SHOT_HOOD = 0.60;
 
-    // Shooter “ready” tolerance
-    private static final double SHOOTER_READY_TOLERANCE = 75.0; // ±75 RPM
+    // =========================
+    // Turret + field tracking settings
+    // =========================
+    // Field goal location on the field (same concept as TeleOp, can be tuned)
+    public static double TARGET_X = 126.5;
+    public static double TARGET_Y = 60.5;
 
-    // -------- Turret control (same math as TeleOp) --------
-    private static final double MOTOR_CPR        = 537.6;  // GoBILDA 312RPM encoder CPR
-    private static final int    GEAR_INPUT_TEETH = 63;
-    private static final int    GEAR_OUTPUT_TEETH= 190;
+    public static double LAST_TARGET_X = 130.25;
+    public static double LAST_TARGET_Y = 63.0;
 
-    private static final double GEAR_RATIO       = (double) GEAR_OUTPUT_TEETH / GEAR_INPUT_TEETH;
-    private static final double TICKS_PER_TURRET_REV = MOTOR_CPR * GEAR_RATIO;
-    private static final double TICKS_PER_DEG    = TICKS_PER_TURRET_REV / 360.0;
-    private static final double DEG_PER_TICK     = 1.0 / TICKS_PER_DEG;
+    private enum ShotType {NORMAL, SECOND, THIRD, FOURTH, LAST}
 
-    private static final double TURRET_KP        = 0.01;
-    private static final double TURRET_HOLD      = 0.05;
-    // Tighter tolerance so it actually returns to the same angle
-    private static final double TURRET_DEG_TOL   = 0.5;    // within 0.5° is “good”
+    private boolean useLastShotTarget = false;
 
-    // Small bias so the turret truly looks centered when returning home
-    // If it starts looking 2° to the RIGHT instead, flip this to -2.0.
-    private static final double TURRET_RETURN_OFFSET_DEG = 2.0;
+    public static boolean USE_HEADING_SCALE = false;
+    public static double HEADING_SCALE = 100.0;
 
-    // Turret angle management
-    private double turretHomeDeg = 0.0;          // angle at start of auton (you align manually)
-    private double turretTargetDeg = 0.0;        // what we’re driving to
-    private boolean turretOffsetApplied = false; // whether we've done the -45° offset
+    // Turret encoder + gearing
+    public static double ENCODER_CPR = 8192.0;
+    public static double ENCODER_TURNS_PER_TURRET_TURN = 222.0 / 12.0; // from TeleOp
+    public static int ENCODER_SIGN = 1;
 
-    // Return-to-home logic at end of auton
-    private boolean turretReturningHome = false;
-    private final ElapsedTime turretReturnTimer = new ElapsedTime();
+    public static double TURRET_SERVO_SIGN = -1.0;
+    public static double TURRET2_SERVO_SIGN = -1.0;
 
-    // Poses (from your adjusted code)
-    private final Pose startPose    = new Pose(123, 60, Math.toRadians(45));
-    private final Pose shoot0       = new Pose(86, 24, Math.toRadians(45));
-    private final Pose preintake    = new Pose(84, 27, Math.toRadians(90));
-    private final Pose intakePose   = new Pose(84, 56, Math.toRadians(90));
-    private final Pose shoot        = new Pose(86, 24, Math.toRadians(90));
-    private final Pose preintakeOne = new Pose(60, 27, Math.toRadians(90));
-    private final Pose intakePose1  = new Pose(60, 66, Math.toRadians(90));
-    private final Pose preGate1  = new Pose(60, 50, Math.toRadians(90));
-    // open gate
-    private final Pose gate         = new Pose(72, 63, Math.toRadians(90));
-    // new positions (4th cycle)
-    private final Pose preintakeTwo = new Pose(36, 27, Math.toRadians(90));
-    private final Pose intakePose2  = new Pose(36, 66, Math.toRadians(90));
-    // intake base (last cycle)
-    private final Pose preintakeThree  = new Pose(50, 73, Math.toRadians(135));
-    private final Pose intakePose3  = new Pose(18, 70, Math.toRadians(135));
-    private final Pose safetyIntake  = new Pose(19, 70, Math.toRadians(135));
-    // parking position after everything is shot
-    private final Pose parkPose     = new Pose(72, 48, Math.toRadians(0));
+    // Angle (deg) we want the turret to *logically* be at when auto starts.
+    // Put the robot down, leave the turret where you like, and this tells the
+    // code what angle that position should be treated as.
+    public static double TURRET_START_DEG = -179.5;
 
-    // Pauses at each shooting position (1 second while intaking)
-    private final ElapsedTime shoot0PauseTimer = new ElapsedTime();
-    private boolean shoot0PauseActive = false;
+    // Mechanical aiming offset (deg). Shifts where the turret points relative to ideal field angle.
+    public static double TURRET_AIM_OFFSET_DEG = 0.0;
 
-    private final ElapsedTime shoot1PauseTimer = new ElapsedTime();
-    private boolean shoot1PauseActive = false;
+    // Cable-safe window (UNWRAPPED degrees) — copied from TeleOp
+    public static double MIN_UNWRAPPED_DEG = -45.0;
+    public static double MAX_UNWRAPPED_DEG = 315.0;
+    public static double LIMIT_MARGIN_DEG = 2.0;
+    public static boolean ALLOW_RECOVERY_WHEN_OUTSIDE_LIMITS = true;
 
-    private final ElapsedTime shoot2PauseTimer = new ElapsedTime();
-    private boolean shoot2PauseActive = false;
+    // Legacy simple move settings (kept but effectively unused)
+    public static int TURRET_MOVE_DIR = +1;
+    public static double TURRET_MOVE_DEG = 45.0;
+    public static double TURRET_MOVE_POWER = 0.35;
+    public static double TURRET_HOLD_POWER = 0.0;
 
-    private final ElapsedTime shoot3PauseTimer = new ElapsedTime();
-    private boolean shoot3PauseActive = false;
+    // ---- TeleOp-style PIDF knobs
+    public static boolean ENABLE_PID = true;
+    public static double kP = 0.018;
+    public static double kI = 0.0;
+    public static double kD = 0.0;
+    public static double kF = 0.08;
+    public static boolean USE_F = true;
 
-    private final ElapsedTime shoot4PauseTimer = new ElapsedTime();
-    private boolean shoot4PauseActive = false;
+    public static double MAX_OUTPUT = 1.0;
+    public static double MIN_OUTPUT = 0.0;
+    public static double DEADBAND_DEG = 2.0;
+    public static double OUTPUT_SLEW_PER_SEC = 0.0;
 
-    private void setPathState(int s) {
-        pathState = s;
-        pathTimer.resetTimer();
+    // ---- TeleOp-style PID internal state
+    private double integral = 0.0;
+    private double prevError = 0.0;
+    private double lastOutput = 0.0;
+    private final ElapsedTime pidTimer = new ElapsedTime();
+
+    // encoder zero (same concept as TeleOp's zeroTicks)
+    private int turretZeroTicks = 0;
+
+    // target we want to hold (legacy hold, no longer used for tracking)
+    private double turretHoldTargetDeg = 0.0;
+    private boolean turretHoldEnabled = false;
+
+    // =========================
+    // Transfer timing (TeleOp-style)
+    // =========================
+    public static class transferConstants {
+        public static double intakePower = 1.0;
+
+        public static double GATE_OPEN = 0.3;
+        public static double GATE_CLOSED = 0.1;
+
+        public static long settleMs = 50;
+        public static long preMs = 100;
+        public static long feedMs = 700;
     }
 
-    // --------------------------------------------------------------------
-    // PATH BUILDING
-    // --------------------------------------------------------------------
-    private void buildPath() {
+    private static final double GATE_WAIT_SEC = 1;
+
+    // =========================
+    // Pedro + paths
+    // =========================
+    private Follower follower;
+
+    private PathChain preload;
+
+    private PathChain rankingPoint;
+
+    private PathChain moveOut;
+
+    private PathChain toRow2Pre, intakeRow2, intakeSafe2, toShootFromRow2;
+    private PathChain shootToGate, gateIntake, gateToShoot;
+
+    private PathChain toRow1Pre, intakeRow1, toShootFromRow1;
+    private PathChain toRow3Pre, intakeRow3, intakeSafe3, toShootFromRow3, rotationEnd;
+
+    private static final PathConstraints SLOW = new PathConstraints(
+            18,
+            33,
+            3.0,
+            4.0
+    );
+
+    // =========================
+    // Hardware
+    // =========================
+    private DcMotor intake;
+    private DcMotorEx intake2;          // also turret encoder (TeleOp-style)
+    private DcMotorEx turretEncoder;    // points to intake2
+
+    private NormalizedColorSensor lower;
+    private NormalizedColorSensor upper;
+
+    private Servo stopper;
+    private ServoImplEx hood;
+    private ShooterPID shooter;
+
+    private CRServo turret;
+    private CRServo turret2;
+
+    // =========================
+    // Intake intent flags
+    // =========================
+    private boolean intakeNow = false;
+    private boolean reverseIntake = false;
+
+    private long lastUpperDetectMs = 0;
+    private long lastLowerDetectMs = 0;
+
+    // =========================
+    // Step queue framework
+    // =========================
+    interface Step {
+        void init();
+        void update();
+        boolean isFinished();
+    }
+
+    static class StepRunner {
+        private final List<Step> steps;
+        private int idx = 0;
+        private boolean inited = false;
+
+        StepRunner(List<Step> steps) { this.steps = steps; }
+
+        void run() {
+            if (idx >= steps.size()) return;
+            Step s = steps.get(idx);
+            if (!inited) { s.init(); inited = true; }
+            s.update();
+            if (s.isFinished()) { idx++; inited = false; }
+        }
+
+        void reset() {
+            idx = 0;
+            inited = false;
+        }
+
+        boolean isDone() { return idx >= steps.size(); }
+        int getIndex() { return idx; }
+    }
+
+    private final List<Step> steps = new ArrayList<>();
+    private StepRunner runner;
+
+    // =========================
+    // Turret legacy one-time move state
+    // (kept, but startTurretRotate45 becomes a no-op so it doesn't fight tracking)
+    // =========================
+    private boolean turretMoved = false;
+    private int turretMoveStartTicks = 0;
+    private int turretMoveTargetDeltaTicks = 0;
+
+    private boolean transferOverride = false;
+
+    // =========================
+    // Shooter priming
+    // =========================
+    private boolean shooterPrimed = false;
+
+    // =========================
+    // Poses
+    // =========================
+    private final Pose startPose = new Pose(112, 54.5, Math.toRadians(190));
+
+    private final Pose unStuck = new Pose(112.5, 54, Math.toRadians(145));
+    private final Pose curvePoint = new Pose(120, 46, Math.toRadians(125));
+    private final Pose pushPose = new Pose(125, 53, Math.toRadians(125));
+    private final Pose shoot0    = new Pose(75.5, 14.5, Math.toRadians(120));
+    private final Pose shoot     = new Pose(75.5, 14.5, Math.toRadians(120));
+    private final Pose shoot1     = new Pose(84.5, 22.5, Math.toRadians(90));
+    private final Pose preintakeOne = new Pose(57, 24, Math.toRadians(100));
+    private final Pose intakePose1  = new Pose(55, 53, Math.toRadians(90));
+    private final Pose intakesafe1 = new Pose(55,54.5, Math.toRadians(90));
+
+    private final Pose rotate = new Pose(55.5, 52, Math.toRadians(60));
+    private final Pose gate   = new Pose(60.1, 60.2, Math.toRadians(55));
+    private final Pose gate1   = new Pose(60, 60.2, Math.toRadians(54.9));
+
+    //private final Pose backitup = new Pose(59.3, 59, Math.toRadians(44));
+
+
+    private final Pose preintake  = new Pose(83, 24, Math.toRadians(90));
+    private final Pose intakePose = new Pose(84.5, 44, Math.toRadians(90));
+
+    private final Pose preintakeTwo = new Pose(27, 19, Math.toRadians(90));
+    private final Pose intakePose2  = new Pose(32, 55, Math.toRadians(90));
+    private final Pose preEnd = new Pose(32, 52, Math.toRadians(145));
+    private final Pose parkPose = new Pose(107.5, 20, Math.toRadians(145));
+
+    // =========================
+    // Build paths
+    // =========================
+    private void buildPaths() {
+
+        moveOut = follower.pathBuilder()
+                .addPath(new BezierLine(startPose, unStuck))
+                .setLinearHeadingInterpolation(startPose.getHeading(), unStuck.getHeading())
+                .build();
+
+        rankingPoint = follower.pathBuilder()
+                .addPath(new BezierCurve(unStuck, curvePoint, pushPose))
+                .setLinearHeadingInterpolation(unStuck.getHeading(), curvePoint.getHeading(), pushPose.getHeading())
+                .build();
 
         preload = follower.pathBuilder()
-                .addPath(new BezierLine(startPose, shoot0))
-                .setLinearHeadingInterpolation(startPose.getHeading(), shoot0.getHeading())
+                .addPath(new BezierLine(pushPose, shoot0))
+                .setLinearHeadingInterpolation(pushPose.getHeading(), shoot0.getHeading())
                 .build();
 
-        preintake1 = follower.pathBuilder()
-                .addPath(new BezierLine(shoot0, preintake))
-                .setLinearHeadingInterpolation(shoot0.getHeading(), preintake.getHeading())
+        // 2nd row
+        toRow2Pre = follower.pathBuilder()
+                .addPath(new BezierCurve(shoot0, preintakeOne, intakePose1))
+                .setLinearHeadingInterpolation(shoot0.getHeading(), preintakeOne.getHeading(), intakePose1.getHeading())
+                .build();
+        intakeSafe2 = follower.pathBuilder()
+                .addPath(new BezierLine(intakePose1, intakesafe1))
+                .setLinearHeadingInterpolation(intakePose1.getHeading(), intakesafe1.getHeading())
+                .build();
+        toShootFromRow2 = follower.pathBuilder()
+                .addPath(new BezierLine(intakesafe1, shoot))
+                .setLinearHeadingInterpolation(intakesafe1.getHeading(), shoot.getHeading())
+                .build();
+        // gate loop
+        shootToGate = follower.pathBuilder()
+                .addPath(new BezierCurve(shoot, rotate, gate))
+                .setLinearHeadingInterpolation(shoot.getHeading(), rotate.getHeading(), gate.getHeading())
+                .setConstraints(SLOW)
+                .build();
+        gateIntake = follower.pathBuilder()
+                .addPath(new BezierLine(gate, gate1))
+                .setLinearHeadingInterpolation(gate.getHeading(), gate1.getHeading())
+                .build();
+        gateToShoot = follower.pathBuilder()
+                .addPath(new BezierCurve(gate, rotate, shoot1))
+                .setLinearHeadingInterpolation(gate.getHeading(), shoot1.getHeading(), shoot1.getHeading())
+                .build();
+        // 1st row
+        toRow1Pre = follower.pathBuilder()
+                .addPath(new BezierLine(shoot1, intakePose))
+                .setLinearHeadingInterpolation(shoot1.getHeading(), intakePose.getHeading())
                 .build();
 
-        intake1 = follower.pathBuilder()
+        intakeRow1 = follower.pathBuilder()
                 .addPath(new BezierLine(preintake, intakePose))
                 .setLinearHeadingInterpolation(preintake.getHeading(), intakePose.getHeading())
                 .build();
 
-        shoot1 = follower.pathBuilder()
+        toShootFromRow1 = follower.pathBuilder()
                 .addPath(new BezierLine(intakePose, shoot))
                 .setLinearHeadingInterpolation(intakePose.getHeading(), shoot.getHeading())
                 .build();
 
-        preintake2 = follower.pathBuilder()
-                .addPath(new BezierLine(shoot, preintakeOne))
-                .setLinearHeadingInterpolation(shoot.getHeading(), preintakeOne.getHeading())
+        // 3rd row
+        toRow3Pre = follower.pathBuilder()
+                .addPath(new BezierCurve(shoot, preintakeTwo, intakePose2))
+                .setLinearHeadingInterpolation(shoot.getHeading(), preintakeTwo.getHeading(), intakePose2.getHeading())
                 .build();
 
-        intake2 = follower.pathBuilder()
-                .addPath(new BezierLine(preintakeOne, intakePose1))
-                .setLinearHeadingInterpolation(preintakeOne.getHeading(), intakePose1.getHeading())
+        rotationEnd = follower.pathBuilder()
+                .addPath(new BezierLine(intakePose2, preEnd))
+                .setLinearHeadingInterpolation(intakePose2.getHeading(), preEnd.getHeading())
+                .build();
+        toShootFromRow3 = follower.pathBuilder()
+                .addPath(new BezierLine(preEnd, parkPose))
+                .setLinearHeadingInterpolation(preEnd.getHeading(), parkPose.getHeading())
                 .build();
 
-        // gate sequence
-        preGate  = follower.pathBuilder()
-                .addPath(new BezierLine(intakePose1, preGate1))
-                .setLinearHeadingInterpolation(intakePose1.getHeading(), preintakeOne.getHeading())
-                .build();
-
-        gateOpen = follower.pathBuilder()
-                .addPath(new BezierLine(preGate1, gate))
-                .setLinearHeadingInterpolation(preintakeOne.getHeading(), gate.getHeading())
-                .build();
-
-        shoot2 = follower.pathBuilder()
-                .addPath(new BezierLine(gate, shoot))
-                .setLinearHeadingInterpolation(gate.getHeading(), shoot.getHeading())
-                .build();
-
-        // 3rd cycle paths
-        preintake3 = follower.pathBuilder()
-                .addPath(new BezierLine(shoot, preintakeTwo))
-                .setLinearHeadingInterpolation(shoot.getHeading(), preintakeTwo.getHeading())
-                .build();
-
-        intake3 = follower.pathBuilder()
-                .addPath(new BezierLine(preintakeTwo, intakePose2))
-                .setLinearHeadingInterpolation(preintakeTwo.getHeading(), intakePose2.getHeading())
-                .build();
-
-        shoot3 = follower.pathBuilder()
-                .addPath(new BezierLine(intakePose2, shoot))
-                .setLinearHeadingInterpolation(intakePose2.getHeading(), shoot.getHeading())
-                .build();
-
-        // last cycle
-        preintake4 = follower.pathBuilder()
-                .addPath(new BezierLine(shoot, preintakeThree))
-                .setLinearHeadingInterpolation(shoot.getHeading(), preintakeThree.getHeading())
-                .build();
-
-        intake4 = follower.pathBuilder()
-                .addPath(new BezierLine(preintakeThree, intakePose3))
-                .setLinearHeadingInterpolation(preintakeThree.getHeading(), intakePose3.getHeading())
-                .build();
-
-        backup = follower.pathBuilder()
-                .addPath(new BezierLine(intakePose3, safetyIntake))
-                .setLinearHeadingInterpolation(intakePose3.getHeading(), safetyIntake.getHeading())
-                .build();
-
-        intake5 = follower.pathBuilder()
-                .addPath(new BezierLine(safetyIntake, intakePose3))
-                .setLinearHeadingInterpolation(safetyIntake.getHeading(), intakePose3.getHeading())
-                .build();
-
-        shoot4 = follower.pathBuilder()
-                .addPath(new BezierLine(intakePose3, shoot))
-                .setLinearHeadingInterpolation(intakePose3.getHeading(), shoot.getHeading())
-                .build();
-
-        // Parking path: from last shooting pose back to parkPose
-        parkPath = follower.pathBuilder()
-                .addPath(new BezierLine(shoot, parkPose))
-                .setLinearHeadingInterpolation(shoot.getHeading(), parkPose.getHeading())
-                .build();
     }
 
-    // --------------------------------------------------------------------
-    // INIT / START / LOOP
-    // --------------------------------------------------------------------
+    // =========================
+    // Step helpers
+    // =========================
+    private Step follow(PathChain path, boolean intakeOn) {
+        return new Step() {
+            @Override public void init() {
+                intakeNow = intakeOn;
+                reverseIntake = false;
+                follower.followPath(path, true);
+            }
+            @Override public void update() { }
+            @Override public boolean isFinished() { return !follower.isBusy(); }
+        };
+    }
+
+    private Step waitSec(double sec) {
+        return new Step() {
+            final ElapsedTime t = new ElapsedTime();
+            @Override public void init() { t.reset(); }
+            @Override public void update() { }
+            @Override public boolean isFinished() { return t.seconds() >= sec; }
+        };
+    }
+
+    private Step followWithMaxPower(PathChain path, boolean intakeOn, double maxPower) {
+        return new Step() {
+            boolean restored = false;
+
+            @Override public void init() {
+                intakeNow = intakeOn;
+                reverseIntake = false;
+                try { follower.setMaxPower(maxPower); } catch (Exception ignored) { }
+                follower.followPath(path, true);
+            }
+
+            @Override public void update() { }
+
+            @Override public boolean isFinished() {
+                boolean done = !follower.isBusy();
+                if (done && !restored) {
+                    restored = true;
+                    try { follower.setMaxPower(1.0); } catch (Exception ignored) { }
+                }
+                return done;
+            }
+        };
+    }
+
+    // =========================
+    // SHOOT STEP (TeleOp-style transfer sequence)
+    // NOTE: NO "wait for RPM" gating.
+    // =========================
+    private Step shootSequenceStep(ShotType shotType) {
+        return new Step() {
+
+            ShootState st;
+            long endMs;
+
+            @Override
+            public void init() {
+                intakeNow = true;
+                reverseIntake = false;
+
+                transferOverride = true;
+
+                double targetRpm = AUTO_RPM;
+                double targetHoodPos = AUTO_HOOD;
+
+                // Choose RPM / hood based on whether this is the last shot
+                switch (shotType) {
+                    case SECOND:
+                        targetRpm = SECOND_RPM;
+                        targetHoodPos = SECOND_HOOD;
+                        break;
+
+                    case THIRD:
+                        targetRpm = THIRD_SHOT_RPM;
+                        targetHoodPos = THIRD_SHOT_HOOD;
+                        break;
+
+                    case FOURTH:
+                        targetRpm = FOURTH_SHOT_RPM;
+                        targetHoodPos = FOURTH_SHOT_HOOD;
+                        break;
+
+                    case LAST:
+                        targetRpm = LAST_SHOT_RPM;
+                        targetHoodPos = LAST_SHOT_HOOD;
+                        useLastShotTarget = true;
+                        break;
+
+                    case NORMAL:
+                    default:
+                        break;
+                }
+
+                shooter.setTargetRPM(targetRpm);
+                if (blueGoalREAL.this.hood != null) {
+                    blueGoalREAL.this.hood.setPosition(targetHoodPos);
+                }
+
+                stopper.setPosition(transferConstants.GATE_CLOSED);
+                intake.setPower(0.0);
+                intake2.setPower(0.0);
+
+                st = ShootState.SETTLE;
+                endMs = System.currentTimeMillis() + transferConstants.settleMs;
+            }
+
+            @Override
+            public void update() {
+                long now = System.currentTimeMillis();
+
+                switch (st) {
+                    case SETTLE:
+                        if (now >= endMs) {
+                            stopper.setPosition(transferConstants.GATE_OPEN);
+                            st = ShootState.PRE;
+                            endMs = now + transferConstants.preMs;
+                        }
+                        break;
+
+                    case PRE:
+                        intake.setPower(transferConstants.intakePower);
+                        intake2.setPower(-transferConstants.intakePower);
+
+                        if (now >= endMs) {
+                            st = ShootState.FEED;
+                            endMs = now + transferConstants.feedMs;
+                        }
+                        break;
+
+                    case FEED:
+                        intake.setPower(transferConstants.intakePower);
+                        intake2.setPower(-transferConstants.intakePower);
+                        if (now >= endMs) {
+                            stopper.setPosition(transferConstants.GATE_CLOSED);
+                            intake.setPower(0.0);
+                            intake2.setPower(0.0);
+                            transferOverride = false;
+                            st = ShootState.DONE;
+                            intakeNow = false;
+                            reverseIntake = false;
+                        }
+                        break;
+
+                    case DONE:
+                    default:
+                        break;
+                }
+            }
+
+            @Override
+            public boolean isFinished() {
+                return st == ShootState.DONE;
+            }
+        };
+    }
+
+    // =========================
+    // Legacy Non-blocking turret rotate + hold (no-op now)
+    // =========================
+    private boolean turretRotating = false;
+
+    private void startTurretRotate45() {
+        // NO-OP for now to avoid fighting turret tracking.
+        turretRotating = false;
+        turretMoved = true;
+    }
+
+    private void updateTurretRotate45() {
+        // NO-OP: we don't use the legacy rotate-45 behavior anymore.
+    }
+
+    // =========================
+    // TeleOp-style PIDF
+    // =========================
+    private double pidfStep(double errorDeg, double dt) {
+        if (Math.abs(errorDeg) <= DEADBAND_DEG) {
+            integral = 0.0;
+            prevError = errorDeg;
+            lastOutput = 0.0;
+            return 0.0;
+        }
+
+        integral += errorDeg * dt;
+        integral = clamp(integral, -200.0, 200.0);
+
+        double derivative = (errorDeg - prevError) / dt;
+        prevError = errorDeg;
+
+        double ff = 0.0;
+        if (USE_F) ff = kF * Math.signum(errorDeg);
+
+        double out = (kP * errorDeg) + (kI * integral) + (kD * derivative) + ff;
+
+        if (MIN_OUTPUT > 0.0) {
+            double s = Math.signum(out);
+            if (Math.abs(out) < MIN_OUTPUT) out = s * MIN_OUTPUT;
+        }
+
+        out = clamp(out, -MAX_OUTPUT, MAX_OUTPUT);
+
+        if (OUTPUT_SLEW_PER_SEC > 0.0) {
+            double maxDelta = OUTPUT_SLEW_PER_SEC * dt;
+            out = clamp(out, lastOutput - maxDelta, lastOutput + maxDelta);
+        }
+
+        lastOutput = out;
+        return out;
+    }
+
+    private double turretDegFromTicksUnwrapped(int ticksFromZero) {
+        double ticksPerTurretRev = ENCODER_CPR * ENCODER_TURNS_PER_TURRET_TURN;
+        return (ticksFromZero / ticksPerTurretRev) * 360.0;
+    }
+
+    // deg -> ticks helper for calibration
+    private int degToTicks(double deg) {
+        double ticksPerTurretRev = ENCODER_CPR * ENCODER_TURNS_PER_TURRET_TURN;
+        return (int) Math.round((deg / 360.0) * ticksPerTurretRev);
+    }
+
+    private double clamp(double v, double lo, double hi) {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    }
+
+    private double wrapDeg(double deg) {
+        deg %= 360.0;
+        if (deg >= 180.0) deg -= 360.0;
+        if (deg < -180.0) deg += 360.0;
+        return deg;
+    }
+
+    private double nearestEquivalentOfAngle(double referenceUnwrapped, double angleWrapped) {
+        double k = Math.round((referenceUnwrapped - angleWrapped) / 360.0);
+        return angleWrapped + 360.0 * k;
+    }
+
+    private double getRobotHeadingDeg(Pose robotPose) {
+        double h = robotPose.getHeading();
+        if (USE_HEADING_SCALE) {
+            return wrapDeg(h * HEADING_SCALE);
+        }
+        return wrapDeg(Math.toDegrees(h));
+    }
+
+    private double desiredTurretDegToPoint(Pose robotPose, double targetX, double targetY) {
+        double dx = targetX - robotPose.getX();
+        double dy = targetY - robotPose.getY();
+
+        double targetBearingDeg = Math.toDegrees(Math.atan2(dy, dx));
+        double robotHeadingDeg = getRobotHeadingDeg(robotPose);
+
+        return wrapDeg(targetBearingDeg - robotHeadingDeg);
+    }
+
+    // === NEW: cable-window logic copied from TeleOp ===
+    private double chooseTargetWithinCableWindow(double targetWrappedDeg, double currentUnwrappedDeg) {
+        double minEff = MIN_UNWRAPPED_DEG + LIMIT_MARGIN_DEG;
+        double maxEff = MAX_UNWRAPPED_DEG - LIMIT_MARGIN_DEG;
+
+        double c0 = targetWrappedDeg;
+        double cPlus = targetWrappedDeg + 360.0;
+        double cMinus = targetWrappedDeg - 360.0;
+
+        boolean in0 = (c0 >= minEff && c0 <= maxEff);
+        boolean inPlus = (cPlus >= minEff && cPlus <= maxEff);
+        boolean inMinus = (cMinus >= minEff && cMinus <= maxEff);
+
+        double best = Double.NaN;
+        double bestDist = Double.POSITIVE_INFINITY;
+
+        if (in0) {
+            double d = Math.abs(c0 - currentUnwrappedDeg);
+            if (d < bestDist) { bestDist = d; best = c0; }
+        }
+        if (inPlus) {
+            double d = Math.abs(cPlus - currentUnwrappedDeg);
+            if (d < bestDist) { bestDist = d; best = cPlus; }
+        }
+        if (inMinus) {
+            double d = Math.abs(cMinus - currentUnwrappedDeg);
+            if (d < bestDist) { bestDist = d; best = cMinus; }
+        }
+
+        if (!Double.isNaN(best)) {
+            return best;
+        }
+
+        double near = nearestEquivalentOfAngle(currentUnwrappedDeg, targetWrappedDeg);
+        return clamp(near, minEff, maxEff);
+    }
+
+    private void updateTurretHold() {
+        if (!turretHoldEnabled) return;
+
+        int ticks = turretEncoder.getCurrentPosition();
+        int ticksFromZero = (ticks - turretZeroTicks);
+        double currentDeg = turretDegFromTicksUnwrapped(ticksFromZero);
+
+        double errorDeg = turretHoldTargetDeg - currentDeg;
+
+        double dt = pidTimer.seconds();
+        pidTimer.reset();
+        if (dt <= 0) dt = 1e-3;
+
+        double output = 0.0;
+        if (ENABLE_PID) output = pidfStep(errorDeg, dt);
+
+        setTurretPower(output);
+    }
+
+    // =========================
+    // TeleOp-style constant turret tracking to field goal (no AprilTag)
+    // =========================
+    private void updateTurretTracking() {
+        if (follower == null || turretEncoder == null) return;
+
+        Pose p = follower.getPose();
+
+        // Current turret position (unwrapped)
+        int ticks = turretEncoder.getCurrentPosition();
+        int ticksFromZero = (ticks - turretZeroTicks) * ENCODER_SIGN;
+        double currentTurretUnwrappedDeg = turretDegFromTicksUnwrapped(ticksFromZero);
+
+        double tx = useLastShotTarget ? LAST_TARGET_X : TARGET_X;
+        double ty = useLastShotTarget ? LAST_TARGET_Y : TARGET_Y;
+
+        // Desired turret angle to look at field goal, plus mechanical offset
+        double desiredTurretWrappedDeg = desiredTurretDegToPoint(p, tx, ty);
+        desiredTurretWrappedDeg = wrapDeg(desiredTurretWrappedDeg + TURRET_AIM_OFFSET_DEG);
+
+        // NO cable limits: just choose the nearest 360° equivalent
+        double safeTargetUnwrappedDeg = nearestEquivalentOfAngle(
+                currentTurretUnwrappedDeg,
+                desiredTurretWrappedDeg
+        );
+
+        double errorDeg = safeTargetUnwrappedDeg - currentTurretUnwrappedDeg;
+
+        double dt = pidTimer.seconds();
+        pidTimer.reset();
+        if (dt <= 0) dt = 1e-3;
+
+        double output;
+
+        if (ENABLE_PID) {
+            output = pidfStep(errorDeg, dt);
+        } else {
+            output = 0.0;
+            integral = 0.0;
+            prevError = 0.0;
+            lastOutput = 0.0;
+        }
+
+        setTurretPower(output);
+        telemetry.addData("TurretCur", currentTurretUnwrappedDeg);
+        telemetry.addData("TurretTarget", safeTargetUnwrappedDeg);
+        telemetry.addData("TurretErr", errorDeg);
+        telemetry.addData("TurretOut", output);
+
+    }
+
+    // =========================
+    // Build auton steps (LONG)
+    // =========================
+    private void buildAutonSteps() {
+        steps.clear();
+
+        steps.add(follow(moveOut, false));
+        steps.add(follow(rankingPoint, false));
+        steps.add(follow(preload, false));
+        steps.add(waitSec(0.2));
+        steps.add(shootSequenceStep(ShotType.NORMAL));
+
+
+        // 2nd row: drive, intake, return -> SHOOT
+        steps.add(follow(toRow2Pre, true));
+        steps.add(follow(intakeSafe2, true));
+        steps.add(follow(toShootFromRow2, false));
+        steps.add(waitSec(0.2));
+        steps.add(shootSequenceStep(ShotType.NORMAL));
+
+        // Gate cycle x1 (loop count easily changed)
+        for (int i = 0; i < 1; i++) {
+            steps.add(followWithMaxPower(shootToGate, false, 0.85));
+            steps.add(waitSec(0.02));
+            steps.add(follow(gateIntake, true));
+            steps.add(waitSec(GATE_WAIT_SEC));
+            steps.add(follow(gateToShoot, false));
+            steps.add(waitSec(0.2));
+            steps.add(shootSequenceStep(ShotType.THIRD));
+        }
+        // 1st row: intake -> SHOOT
+        steps.add(follow(toRow1Pre, true));
+        steps.add(follow(toShootFromRow1, false));
+        steps.add(waitSec(0.2));
+        steps.add(shootSequenceStep(ShotType.NORMAL));
+
+        // 3rd row: intake -> park waypoint -> SHOOT
+        steps.add(follow(toRow3Pre, true));
+        steps.add(follow(rotationEnd, false));
+        steps.add(follow(toShootFromRow3, false));
+
+        steps.add(waitSec(0.45));
+        steps.add(shootSequenceStep(ShotType.LAST));
+    }
+
+    // =========================
+    // FTC lifecycle
+    // =========================
     @Override
     public void init() {
-
         follower = Constants.createFollower(hardwareMap);
         follower.setStartingPose(startPose);
 
-        pathTimer = new Timer();
+        buildPaths();
 
-        intakeMotor  = hardwareMap.get(DcMotor.class, "intake");
-        turretMotor  = hardwareMap.get(DcMotor.class, "turret");
-        kickerServo  = hardwareMap.get(Servo.class, "kicker");
-        stopperServo = hardwareMap.get(Servo.class, "stopper");
-        imu          = hardwareMap.get(IMU.class, "imu"); // if you want later
+        intake = hardwareMap.get(DcMotor.class, "intake");
+
+        // Turret encoder mapping matches TeleOp: "intake2"
+        intake2 = hardwareMap.get(DcMotorEx.class, "intake2");
+        turretEncoder = intake2;
+
+        lower = hardwareMap.get(ColorRangeSensor.class, "lower");
+        upper = hardwareMap.get(ColorRangeSensor.class, "upper");
+
+        stopper = hardwareMap.get(Servo.class, "stopper");
+        hood = hardwareMap.get(ServoImplEx.class, "hood");
+
+        turret = hardwareMap.get(CRServo.class, "turret");
+        turret2 = hardwareMap.get(CRServo.class, "turret2");
 
         shooter = new ShooterPID(hardwareMap, "f1M", "f2M");
 
-        intakeMotor.setPower(0.0);
-        kickerServo.setPosition(0.5);
-        stopperServo.setPosition(0.5);
+        intake.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        intake2.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
 
-        // Turret setup (encoder-based only, no IMU aiming in auto)
-        turretMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-        turretMotor.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
-        turretMotor.setPower(0.0);
+        turretEncoder.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+        turretEncoder.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
 
-        buildPath();
-    }
+        // Calibrate so that the physical turret angle at init is TURRET_START_DEG.
+        int rawTicks = turretEncoder.getCurrentPosition(); // after reset, usually 0
+        int offsetTicks = degToTicks(TURRET_START_DEG) * ENCODER_SIGN;
+        // When ticks == rawTicks, turretDegFromTicksUnwrapped(...) == TURRET_START_DEG * ENCODER_SIGN
+        turretZeroTicks = rawTicks - offsetTicks;
 
-    @Override
-    public void init_loop() {
-        // keep servos safe during init
-        if (kickerServo != null) kickerServo.setPosition(0.5);
-        if (stopperServo != null) stopperServo.setPosition(0.5);
+        stopper.setPosition(transferConstants.GATE_CLOSED);
+        intake.setPower(0.0);
+        intake2.setPower(0.0);
+        setTurretPower(0.0);
+
+        turretMoved = false;
+        turretRotating = false;
+        turretHoldEnabled = false;
+
+        // prime shooter immediately
+        shooter.setTargetRPM(AUTO_RPM);
+        if (hood != null) hood.setPosition(AUTO_HOOD);
+        shooterPrimed = true;
+
+        pidTimer.reset();
+
+        buildAutonSteps();
+        runner = new StepRunner(steps);
     }
 
     @Override
     public void start() {
-        // Servo defaults at start
-        kickerServo.setPosition(0.5);
-        stopperServo.setPosition(0.5);
+        if (runner != null) runner.reset();
 
-        // Capture turret "home" angle at start (you manually align it)
-        int turretTicks = 0;
-        try {
-            turretTicks = turretMotor.getCurrentPosition();
-        } catch (Exception ignored) {}
-        turretHomeDeg = turretTicks * DEG_PER_TICK;
-        turretTargetDeg = turretHomeDeg;
-        turretOffsetApplied = false;
-        turretReturningHome = false;
+        shooter.setTargetRPM(AUTO_RPM);
+        if (hood != null) hood.setPosition(AUTO_HOOD);
+        shooterPrimed = true;
 
-        shoot0PauseActive = false;
-        shoot1PauseActive = false;
-        shoot2PauseActive = false;
-        shoot3PauseActive = false;
-        shoot4PauseActive = false;
-
-        // Spin up shooter based on initial position
-        updateShooterTargetFromPose();
-        shooter.update();
-
-        setPathState(0);
+        pidTimer.reset();
     }
 
     @Override
     public void loop() {
-
-        // Update follower (pose, path progress)
         follower.update();
 
-        // Shooter RPM control based on distance to goal
-        updateShooterTargetFromPose();
+        // turret tracking every loop based on Pedro odometry (TeleOp-style, field-point only)
+        updateTurretTracking();
+
+        // Legacy helpers (now effectively no-op, since rotate45 is disabled
+        // and turretHoldEnabled is false)
+        updateTurretRotate45();
+        updateTurretHold();
+
+        if (!shooterPrimed) {
+            shooter.setTargetRPM(AUTO_RPM);
+            if (hood != null) hood.setPosition(AUTO_HOOD);
+            shooterPrimed = true;
+        }
         shooter.update();
 
-        // Turret holds / moves to target angle
-        updateTurret();
-
-        // Transfer sequence (3-ball shot) state machine
-        runTransfer();
-
-        // Normal intake control only when NOT in transfer
-        if (!transferRunning) {
-            intakeMotor.setPower(intakeNow ? Meet3TeleOpB.transferConstants.intakePower : 0.0);
+        if (!transferOverride) {
+            autoIntakeControl(intakeNow, reverseIntake);
         }
 
-        // Path state machine
-        pathUpdate();
+        runner.run();
 
-        // Telemetry
-        try {
-            telemetry.addData("State", pathState);
-            telemetry.addData("t", follower.getCurrentTValue());
-            telemetry.addData("x", follower.getPose().getX());
-            telemetry.addData("y", follower.getPose().getY());
-            telemetry.addData("heading", Math.toDegrees(follower.getPose().getHeading()));
-        } catch (Exception ignored) {}
-        telemetry.addData("Shooter Target RPM", shooter.getTargetRPM());
-        telemetry.addData("Shooter RPM", shooter.getCurrentRPM());
-        telemetry.addData("Transfer Running", transferRunning);
-        telemetry.addData("Turret Home Deg", turretHomeDeg);
-        telemetry.addData("Turret Target Deg", turretTargetDeg);
-        telemetry.addData("Shoot0Pause", shoot0PauseActive);
-        telemetry.addData("Shoot1Pause", shoot1PauseActive);
-        telemetry.addData("Shoot2Pause", shoot2PauseActive);
-        telemetry.addData("Shoot3Pause", shoot3PauseActive);
-        telemetry.addData("Shoot4Pause", shoot4PauseActive);
+        if (runner.isDone() && !follower.isBusy()) {
+            requestOpModeStop();
+        }
+
         telemetry.update();
     }
 
     @Override
     public void stop() {
-        shooter.stop();
-        intakeMotor.setPower(0.0);
-        turretMotor.setPower(0.0);
-        kickerServo.setPosition(0.5);
-        stopperServo.setPosition(0.5);
+        intake.setPower(0.0);
+        intake2.setPower(0.0);
+        setTurretPower(0.0);
+        if (stopper != null) stopper.setPosition(transferConstants.GATE_CLOSED);
+        if (shooter != null) shooter.setTargetRPM(0.0);
     }
 
-    // --------------------------------------------------------------------
-    // PATH LOGIC (5 shooting cycles + park + turret return)
-    // --------------------------------------------------------------------
-    private void pathUpdate() {
-
-        switch (pathState) {
-
-            // ---- PRELOAD: startPose → shoot0, INTAKE ON from start ----
-            case 0:
-                intakeNow = true;
-                follower.followPath(preload, true);
-                setPathState(1);
-                break;
-
-            // At shoot0 → wait 1s WHILE INTAKING, then run first 3-ball transfer
-            case 1:
-                if (!follower.isBusy()) {
-                    if (!shoot0PauseActive) {
-                        shoot0PauseActive = true;
-                        shoot0PauseTimer.reset();
-                        intakeNow = true;  // keep feeding while robot settles
-                    } else {
-                        if (shoot0PauseTimer.seconds() >= 0.25 && !transferRunning) {
-                            intakeNow = false; // transfer takes over intake
-                            startTransfer();   // 🔥 first 3
-                            shoot0PauseActive = false;
-                            setPathState(2);
-                        }
-                    }
-                }
-                break;
-
-            // ---- INTAKE 1 ---- (for second 3-shot)
-            // Wait for transfer1 done → go to preintake1
-            case 2:
-                if (!transferRunning) {
-                    intakeNow = true;
-                    follower.followPath(preintake1, true);
-                    setPathState(3);
-                }
-                break;
-
-            // preintake1 → intake1 (collect 3 more)
-            case 3:
-                intakeNow = true;
-                follower.followPath(intake1, true);
-                setPathState(4);
-                break;
-
-            // After intake1 finished → drive back to shoot1, apply turret -45° while driving
-            case 4:
-                if (!follower.isBusy()) {
-                    intakeNow = true; // intake still on while driving back
-
-                    // First time we head back to shoot1: rotate turret 45° RIGHT (negative)
-                    if (!turretOffsetApplied) {
-                        turretTargetDeg = turretHomeDeg - 45.0;
-                        turretOffsetApplied = true;
-                    }
-
-                    follower.followPath(shoot1, true);
-                    setPathState(5);
-                }
-                break;
-
-            // At shoot1 → wait 1s WHILE INTAKING, then run second 3-ball transfer
-            case 5:
-                if (!follower.isBusy()) {
-                    if (!shoot1PauseActive) {
-                        shoot1PauseActive = true;
-                        shoot1PauseTimer.reset();
-                        intakeNow = true;
-                    } else {
-                        if (shoot1PauseTimer.seconds() >= 0.25 && !transferRunning) {
-                            intakeNow = false;
-                            startTransfer();   // 🔥 second 3
-                            shoot1PauseActive = false;
-                            setPathState(6);
-                        }
-                    }
-                }
-                break;
-
-            // ---- INTAKE 2 + GATE + SHOOT2 ----
-            // Wait transfer2 done → preintake2
-            case 6:
-                if (!transferRunning) {
-                    intakeNow = true;
-                    follower.followPath(preintake2, true);
-                    setPathState(7);
-                }
-                break;
-
-            // preintake2 → intake2 (INTAKE ON)
-            case 7:
-                intakeNow = true;
-                follower.followPath(intake2, true);
-                setPathState(8);
-                break;
-
-            // After intake2 finished → preGate (INTAKE ON)
-            case 8:
-                if (!follower.isBusy()) {
-                    intakeNow = true;
-                    follower.followPath(preGate, true);
-                    setPathState(9);
-                }
-                break;
-
-            // preGate → gateOpen (INTAKE ON)
-            case 9:
-                if (!follower.isBusy()) {
-                    intakeNow = true;
-                    follower.followPath(gateOpen, true);
-                    setPathState(10);
-                }
-                break;
-
-            // gateOpen → shoot2 (INTAKE ON)
-            case 10:
-                if (!follower.isBusy()) {
-                    intakeNow = true;
-                    follower.followPath(shoot2, true);
-                    setPathState(11);
-                }
-                break;
-
-            // At shoot2 → wait 1s WHILE INTAKING, then run third 3-ball transfer
-            case 11:
-                if (!follower.isBusy()) {
-                    if (!shoot2PauseActive) {
-                        shoot2PauseActive = true;
-                        shoot2PauseTimer.reset();
-                        intakeNow = true; // still feeding
-                    } else {
-                        if (shoot2PauseTimer.seconds() >= 0.25 && !transferRunning) {
-                            intakeNow = false;
-                            startTransfer();   // 🔥 third 3
-                            shoot2PauseActive = false;
-                            setPathState(12);
-                        }
-                    }
-                }
-                break;
-
-            // ---- INTAKE 3 ---- (for fourth 3-shot)
-            // Wait transfer3 done → preintake3
-            case 12:
-                if (!transferRunning) {
-                    intakeNow = true;
-                    follower.followPath(preintake3, true);
-                    setPathState(13);
-                }
-                break;
-
-            // preintake3 → intake3
-            case 13:
-                intakeNow = true;
-                follower.followPath(intake3, true);
-                setPathState(14);
-                break;
-
-            // After intake3 finished → shoot3
-            case 14:
-                if (!follower.isBusy()) {
-                    intakeNow = true;
-                    follower.followPath(shoot3, true);
-                    setPathState(15);
-                }
-                break;
-
-            // At shoot3 → wait 1s WHILE INTAKING, then run fourth 3-ball transfer
-            case 15:
-                if (!follower.isBusy()) {
-                    if (!shoot3PauseActive) {
-                        shoot3PauseActive = true;
-                        shoot3PauseTimer.reset();
-                        intakeNow = true;
-                    } else {
-                        if (shoot3PauseTimer.seconds() >= 0.25 && !transferRunning) {
-                            intakeNow = false;
-                            startTransfer();   // 🔥 fourth 3
-                            shoot3PauseActive = false;
-                            setPathState(16);
-                        }
-                    }
-                }
-                break;
-
-            // ---- INTAKE 4 ---- (for fifth and final 3-shot)
-            // Wait transfer4 done → preintake4
-            case 16:
-                if (!transferRunning) {
-                    intakeNow = true;
-                    follower.followPath(preintake4, true);
-                    setPathState(17);
-                }
-                break;
-
-            // preintake4 → intake4 (INTAKE ON)
-            case 17:
-                intakeNow = true;
-                follower.followPath(intake4, true);
-                setPathState(18);
-                break;
-
-            // After intake4 finished → backup path (INTAKE OFF)
-            case 18:
-                if (!follower.isBusy()) {
-                    intakeNow = false;
-                    follower.followPath(backup, true);
-                    setPathState(19);
-                }
-                break;
-
-            // backup → intake5 (INTAKE ON again)
-            case 19:
-                if (!follower.isBusy()) {
-                    intakeNow = true;
-                    follower.followPath(intake5, true);
-                    setPathState(20);
-                }
-                break;
-
-            // After intake5 finished → go to final shoot4 position
-            case 20:
-                if (!follower.isBusy()) {
-                    intakeNow = true; // keep feeding while going to shoot4
-                    follower.followPath(shoot4, true);
-                    setPathState(21);
-                }
-                break;
-
-            // At shoot4 → wait 1s WHILE INTAKING, then run final 3-ball transfer
-            case 21:
-                if (!follower.isBusy()) {
-                    if (!shoot4PauseActive) {
-                        shoot4PauseActive = true;
-                        shoot4PauseTimer.reset();
-                        intakeNow = true;
-                    } else {
-                        if (shoot4PauseTimer.seconds() >= 0.25 && !transferRunning) {
-                            intakeNow = false;
-                            startTransfer();   // 🔥 fifth 3
-                            shoot4PauseActive = false;
-                            setPathState(22);
-                        }
-                    }
-                }
-                break;
-
-            // Wait final transfer done → drive to park point
-            case 22:
-                if (!transferRunning) {
-                    intakeNow = false;
-                    follower.followPath(parkPath, true);
-                    setPathState(23);
-                }
-                break;
-
-            // Wait until parked at parkPose, then start turret return
-            case 23:
-                if (!follower.isBusy()) {
-                    intakeNow = false;
-                    if (!turretReturningHome) {
-                        // Apply small offset so visually it returns dead center
-                        turretTargetDeg = turretHomeDeg + TURRET_RETURN_OFFSET_DEG;
-                        turretReturningHome = true;
-                        turretReturnTimer.reset();
-                    }
-                    setPathState(24);
-                }
-                break;
-
-            // Drive turret back to (home + offset) angle
-            case 24:
-                intakeNow = false;
-                // give it up to ~1.5s or until it's within tighter tolerance
-                if (turretReturnTimer.seconds() >= 1.5 || turretAtTarget()) {
-                    setPathState(25);
-                }
-                break;
-
-            // Finished – hold everything off and stop the OpMode
-            case 25:
-            default:
-                intakeNow = false;
-                requestOpModeStop();
-                break;
-        }
+    // =========================
+    // Turret power helper
+    // =========================
+    private void setTurretPower(double ccwPositivePower) {
+        if (turret != null)  turret.setPower(ccwPositivePower * TURRET_SERVO_SIGN);
+        if (turret2 != null) turret2.setPower(ccwPositivePower * TURRET2_SERVO_SIGN);
     }
 
-    // --------------------------------------------------------------------
-    // SHOOTER CONTROL (fixed RPM in auto right now)
-    // --------------------------------------------------------------------
-    private void updateShooterTargetFromPose() {
-        // If you later want distance-based RPM, you already have dx/dy below.
-        double rx = 0.0;
-        double ry = 0.0;
-        try {
-            Pose p = follower.getPose();
-            rx = p.getX();
-            ry = p.getY();
-        } catch (Exception ignored) {}
-
-        double goalX = Meet3TeleOpB.Goal.X;
-        double goalY = Meet3TeleOpB.Goal.Y;
-
-        double dx = goalX - rx;
-        double dy = goalY - ry;
-        double dist = Math.hypot(dx, dy);
-
-        // Currently using flat value – adjust if needed
-        double rpm = 532;
-        shooter.setTargetRPM(rpm);
-    }
-
-    private boolean isShooterAtSpeed() {
-        double target = shooter.getTargetRPM();
-        if (target < 100.0) return false;
-        return Math.abs(shooter.getCurrentRPM() - target) <= SHOOTER_READY_TOLERANCE;
-    }
-
-    // --------------------------------------------------------------------
-    // TURRET HELPERS (encoder-only; no IMU aiming in auto)
-    // --------------------------------------------------------------------
-    private static double wrapDeg(double a) {
-        while (a > 180) a -= 360;
-        while (a < -180) a += 360;
-        return a;
-    }
-
-    private boolean driveTurretToDeg(double targetTurretDeg) {
-        int ticks = turretMotor.getCurrentPosition();
-        double turretDegNow = ticks * DEG_PER_TICK;
-        double errDeg = wrapDeg(targetTurretDeg - turretDegNow);
-
-        if (Math.abs(errDeg) <= TURRET_DEG_TOL) {
-            turretMotor.setPower(0.0);
-            return true;
+    // =========================
+    // Color-sensor intake logic
+    // =========================
+    private void autoIntakeControl(boolean wantIntake, boolean wantReverse) {
+        if (!wantIntake) {
+            intake.setPower(0.0);
+            intake2.setPower(0.0);
+            return;
         }
 
-        double cmd = TURRET_KP * (errDeg * TICKS_PER_DEG);
+        String lowerColor = getColor(lower);
+        String upperColor = getColor(upper);
 
-        double maxPower = Meet3TeleOpB.Goal.TURRET_MAX_POWER; // same cap as TeleOp
-        if (cmd > maxPower) cmd = maxPower;
-        if (cmd < -maxPower) cmd = -maxPower;
+        long now = System.currentTimeMillis();
 
-        // gentle minimum hold so it doesn't coast
-        if (Math.abs(cmd) < TURRET_HOLD) {
-            cmd = Math.signum(cmd) * TURRET_HOLD;
+        if (isGreenOrPurple(upperColor)) lastUpperDetectMs = now;
+        if (isGreenOrPurple(lowerColor)) lastLowerDetectMs = now;
+
+        boolean upperRecent = (now - lastUpperDetectMs) < 1000;
+
+        double p1, p2;
+
+        if (!wantReverse) {
+            p1 = transferConstants.intakePower;
+            p2 = -transferConstants.intakePower;
+        } else {
+            p1 = -transferConstants.intakePower;
+            p2 = transferConstants.intakePower;
         }
 
-        turretMotor.setPower(cmd);
-        return Math.abs(errDeg) <= TURRET_DEG_TOL;
-    }
-
-    private void updateTurret() {
-        driveTurretToDeg(turretTargetDeg);
-    }
-
-    private boolean turretAtTarget() {
-        int ticks = turretMotor.getCurrentPosition();
-        double turretDegNow = ticks * DEG_PER_TICK;
-        double errDeg = wrapDeg(turretTargetDeg - turretDegNow);
-        return Math.abs(errDeg) <= TURRET_DEG_TOL;
-    }
-
-    // --------------------------------------------------------------------
-    // TRANSFER (3 balls, TeleOp timings)
-    // --------------------------------------------------------------------
-    private void startTransfer() {
-        transferRunning = true;
-        transferStep = 0;
-        transferTimer.reset();
-
-        // Start transfer with stopper open like TeleOp
-        kickerServo.setPosition(0.5);  // neutral
-        stopperServo.setPosition(0.0); // open gate at transfer start
-    }
-
-    private void runTransfer() {
-        if (!transferRunning) return;
-
-        switch (transferStep) {
-            // Step 0: Wait for shooter at speed
-            case 0:
-                if (isShooterAtSpeed()) {
-                    // first intake burst
-                    intakeMotor.setPower(Meet3TeleOpB.transferConstants.intakePower);
-                    transferTimer.reset();
-                    transferStep = 1;
-                }
-                break;
-
-            // Step 1: keep intake on for firstWait, then stop
-            case 1:
-                if (transferTimer.milliseconds() >= 100) {
-                    intakeMotor.setPower(0.0);
-                    transferTimer.reset();
-                    transferStep = 2;
-                }
-                break;
-
-            // Step 2: pauseWait with intake off
-            case 2:
-                if (transferTimer.milliseconds() >= 150) {
-                    // second intake burst
-                    intakeMotor.setPower(Meet3TeleOpB.transferConstants.intakePower);
-                    transferTimer.reset();
-                    transferStep = 3;
-                }
-                break;
-
-            // Step 3: after pauseWait2, stop intake and fire kicker
-            case 3:
-                if (transferTimer.milliseconds() >= 150) {
-                    intakeMotor.setPower(0.0);
-                    kickerServo.setPosition(0.0); // fire
-                    transferTimer.reset();
-                    transferStep = 4;
-                }
-                break;
-
-            // Step 4: waitAfterKick, then reset servos and finish
-            case 4:
-                if (transferTimer.milliseconds() >= 100) {
-                    kickerServo.setPosition(0.5);
-                    stopperServo.setPosition(0.5);
-                    intakeMotor.setPower(0.0);
-
-                    transferRunning = false;
-                    transferStep = 0;
-                }
-                break;
+        if (upperRecent) {
+            p2 = 0.0;
         }
+
+        intake.setPower(p1);
+        intake2.setPower(p2);
+    }
+
+    private String getColor(NormalizedColorSensor sensor) {
+        NormalizedRGBA color = sensor.getNormalizedColors();
+        double hue = JavaUtil.colorToHue(color.toColor());
+
+        if (hue < 30) return "red";
+        if (hue < 60) return "orange";
+        if (hue < 90) return "yellow";
+        if (hue < 150) return "green";
+        if (hue < 225) return "green";
+        if (hue < 350) return "purple";
+        return "red";
+    }
+
+    private boolean isGreenOrPurple(String c) {
+        return "green".equals(c) || "purple".equals(c);
     }
 }

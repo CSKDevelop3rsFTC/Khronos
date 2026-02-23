@@ -9,6 +9,7 @@ import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
 import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.DcMotorSimple;
+import com.qualcomm.robotcore.hardware.ServoImplEx;
 import com.qualcomm.robotcore.util.ElapsedTime;
 import com.seattlesolvers.solverslib.controller.PIDFController;
 
@@ -18,10 +19,10 @@ import com.seattlesolvers.solverslib.controller.PIDFController;
 public class newTuner extends LinearOpMode {
 
     // Tunables from Dashboard
-    public static double P = 0.004;
+    public static double P = 0.003;
     public static double I = 0.0;
     public static double D = 0.000;
-    public static double F = 0.00055;
+    public static double F = 0.00042;
 
     // target velocity in ticks per second (or whatever units your encoder reports)
     public static double TARGET_VEL = 0.0;
@@ -29,6 +30,10 @@ public class newTuner extends LinearOpMode {
 
     private DcMotorEx leftMotor;
     private DcMotorEx rightMotor;
+
+    private ServoImplEx hood;
+
+    public static double hoodAngle = 0.78;
 
     private DcMotor intake;
     private DcMotor intake2;
@@ -46,9 +51,11 @@ public class newTuner extends LinearOpMode {
         intake = hardwareMap.get(DcMotor.class, "intake");
         intake2 = hardwareMap.get(DcMotor.class, "intake2");
 
+        hood = hardwareMap.get(ServoImplEx.class, "hood");
+
         // Make them spin the same direction
-        leftMotor.setDirection(DcMotorSimple.Direction.REVERSE);
-        rightMotor.setDirection(DcMotorSimple.Direction.FORWARD);
+        leftMotor.setDirection(DcMotorSimple.Direction.FORWARD);
+        rightMotor.setDirection(DcMotorSimple.Direction.REVERSE);
 
         leftMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         rightMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
@@ -67,6 +74,12 @@ public class newTuner extends LinearOpMode {
         waitForStart();
 
         while (opModeIsActive()) {
+
+            hoodAngle = Math.max(0.2, Math.min(0.99, hoodAngle));
+            if (hood != null) {
+                hood.setPosition(hoodAngle);
+            }
+            
             if (gamepad1.left_trigger > 0) {
                 intake.setPower(-1);
                 intake2.setPower(1);

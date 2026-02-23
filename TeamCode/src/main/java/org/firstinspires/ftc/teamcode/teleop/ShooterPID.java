@@ -15,10 +15,10 @@ import com.seattlesolvers.solverslib.controller.PIDFController;
 public class ShooterPID {
 
     // Same tunables as in newTuner
-    public static double P = 0.004;
+    public static double P = 0.003;
     public static double I = 0.0;
-    public static double D = 0.000;
-    public static double F = 0.00047;
+    public static double D = 0.0005;
+    public static double F = 0.00042;
 
     // "RPM" / velocity units, same as TARGET_VEL in newTuner
     public static double TARGET_VEL = 0.0;
@@ -42,8 +42,8 @@ public class ShooterPID {
         rightMotor = hardwareMap.get(DcMotorEx.class, rightName);
 
         // Make them spin the same direction
-        leftMotor.setDirection(DcMotorSimple.Direction.REVERSE);
-        rightMotor.setDirection(DcMotorSimple.Direction.FORWARD);
+        leftMotor.setDirection(DcMotorSimple.Direction.FORWARD);
+        rightMotor.setDirection(DcMotorSimple.Direction.REVERSE);
 
         leftMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         rightMotor.setMode(DcMotor.RunMode.RUN_USING_ENCODER);

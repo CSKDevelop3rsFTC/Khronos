@@ -10,7 +10,6 @@ import com.qualcomm.hardware.gobilda.GoBildaPinpointDriver;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
 import com.qualcomm.robotcore.hardware.CRServo;
-import com.qualcomm.robotcore.hardware.CRServoImplEx;
 import com.qualcomm.robotcore.hardware.ColorRangeSensor;
 import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
@@ -27,7 +26,6 @@ import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.DistanceUnit;
 import org.firstinspires.ftc.robotcore.external.navigation.Position;
 import org.firstinspires.ftc.robotcore.external.navigation.YawPitchRollAngles;
-import org.firstinspires.ftc.teamcode.teleop.ShooterPID;
 import org.firstinspires.ftc.vision.VisionPortal;
 import org.firstinspires.ftc.vision.apriltag.AprilTagDetection;
 import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor;
@@ -37,8 +35,8 @@ import java.util.List;
 import org.firstinspires.ftc.teamcode.pedropathing.Constants;
 
 @Config
-@TeleOp(name = "MasterTeleOp", group = "Pedro Pathing")
-public class MasterTeleOp extends OpMode {
+@TeleOp(name = "MasterTeleOp - Blue", group = "Pedro Pathing")
+public class MasterTeleOpBlue extends OpMode {
 
     private Follower follower;
 
@@ -58,7 +56,7 @@ public class MasterTeleOp extends OpMode {
 
     public static double START_X = 24;
     public static double START_Y = 24;
-    public static double START_HEADING = 0.7854;
+    public static double START_HEADING = Math.toRadians(45);
 
     // =======================
     // Encoder + gearing (unchanged)
@@ -73,8 +71,8 @@ public class MasterTeleOp extends OpMode {
     // =======================
     // Cable-safe window (UNWRAPPED degrees)
     // =======================
-    public static double MIN_UNWRAPPED_DEG = -142.5;
-    public static double MAX_UNWRAPPED_DEG = 217.5;
+    public static double MIN_UNWRAPPED_DEG = -45.0;
+    public static double MAX_UNWRAPPED_DEG = 315.0;
     public static double LIMIT_MARGIN_DEG = 2.0;
     public static boolean ALLOW_RECOVERY_WHEN_OUTSIDE_LIMITS = true;
 
@@ -116,6 +114,10 @@ public class MasterTeleOp extends OpMode {
 
     public ServoImplEx left = null;
     public ServoImplEx right = null;
+
+    public double hoodOffset = 0;
+
+    public double hoodOffsetFar = 0;
     public ServoImplEx top = null;
 
     private NormalizedColorSensor lower;
@@ -126,15 +128,34 @@ public class MasterTeleOp extends OpMode {
     private boolean prevLB = false;
     private boolean prevMid = false;
 
+    // NEW: gamepad2 edges + override
+    private boolean prevStart2 = false;
+    private boolean prevY2 = false;
+    private boolean turretManualOverride = false;
+
     private double fieldDistIn = 0.0;
-    private double rpmPoly = 0.0;
-    private double hoodPos = 0.0;
+    public static double rpmPoly = 0.0;
+    public static double hoodPos = 0.0;
+
+    public static int rpmCloseOffset = 40;
+
+    public static int rpmFarOffset = 50;
+
+    // NEW: manual turret power (dashboard-tunable)
+    public static double TURRET_MANUAL_POWER = 0.4;
+
+    // NEW: relocalization pose (dashboard-tunable)
+    public static double RELOCALIZE_X = -64.5;
+    public static double RELOCALIZE_Y = 65;
+    public static double RELOCALIZE_HEADING_DEG = 0.0;
 
     // Tracks last time BOTH sensors saw a ball (green/purple)
     private long lastBothDetectedMs = 0;
 
     // NEW: tracks last time UPPER-only saw a ball (upper green/purple, lower not)
     private long lastUpperOnlyDetectedMs = 0;
+
+    private double transferSpeed = 1;
 
     // =======================
     // PIDF knobs (Dashboard)
@@ -152,6 +173,9 @@ public class MasterTeleOp extends OpMode {
     public static double kP = 0.018;
     public static double kI = 0.0;
     public static double kD = 0.0;
+
+    public static double offsetPower = 0.0004;
+    public static double offsetPowerFar = 0.0006;
 
     // Applied as kF * sign(error) when error is outside DEADBAND_DEG.
     public static double kF = 0.08;
@@ -240,8 +264,10 @@ public class MasterTeleOp extends OpMode {
         shooter.setTelemetry(new MultipleTelemetry(telemetry, FtcDashboard.getInstance().getTelemetry()));
 
         turretEncoder = hardwareMap.get(DcMotorEx.class, "intake2");
-        turretEncoder.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
         turretEncoder.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
+        int ticksNow = turretEncoder.getCurrentPosition();
+        double ticksFromZeroWanted = 618.3; // example: using 274.58Â° option from the CSV
+        zeroTicks = (int) Math.round(ticksNow - (ticksFromZeroWanted / ENCODER_SIGN));
 
         stopper = hardwareMap.get(Servo.class, "stopper");
 
@@ -256,8 +282,6 @@ public class MasterTeleOp extends OpMode {
 
         //liftL = hardwareMap.get(CRServo.class, "liftL");
         //liftR = hardwareMap.get(CRServo.class, "liftR");
-
-        zeroTicks = 0;
         setTurretPower(0);
 
         hadRecentTag = false;
@@ -290,6 +314,9 @@ public class MasterTeleOp extends OpMode {
         lastTagYawDegUsed = 0;
         lastDecisionMargin = 0;
 
+        // NEW: handle gamepad2 features (turret override + relocalization)
+        gamepad2Controls();
+
         transferControl();
         shooterGamepad();
         hoodControl();
@@ -305,13 +332,13 @@ public class MasterTeleOp extends OpMode {
 
         follower.setTeleOpDrive(
                 -gamepad1.left_stick_y,
-                gamepad1.left_stick_x,
+                -gamepad1.left_stick_x,
                 -gamepad1.right_stick_x,
                 true
         );
         follower.update();
 
-        if (gamepad1.y) {
+        if (gamepad1.x) {
             zeroTicks = turretEncoder.getCurrentPosition();
             haveTagFieldAngle = false;
 
@@ -326,14 +353,19 @@ public class MasterTeleOp extends OpMode {
 
         fieldDistIn = Math.hypot(TARGET_X - p.getX(), TARGET_Y - p.getY());
 
-        rpmPoly  = (-0.0145136 * Math.pow(fieldDistIn, 2))
-                + (9.58344   * fieldDistIn)
-                + 805.2596;
+        transferSpeed = 1;
 
-        hoodPos = (7.32375e-7 * Math.pow(fieldDistIn, 3))
-                - (0.000206136 * Math.pow(fieldDistIn, 2))
-                + (0.0232196     * fieldDistIn)
-                - 0.18686;
+        hoodOffset = (shooter.getTargetRPM() - shooter.getCurrentRPM()) * offsetPower;
+
+        hoodOffsetFar = (shooter.getTargetRPM() - shooter.getCurrentRPM()) * offsetPowerFar;
+
+        if (fieldDistIn <= 70) {
+            rpmPoly = (8.28523 * fieldDistIn) + 1112.59177 - rpmCloseOffset;
+            hoodPos = (-1.02564 + 0.400334 * Math.log(fieldDistIn))  - hoodOffset;
+        } else {
+            rpmPoly = (8.28523 * fieldDistIn) + 1112.59177 - rpmFarOffset;
+            hoodPos = (-1.05564 + 0.400334 * Math.log(fieldDistIn)) - hoodOffsetFar;
+        }
 
         hoodPos = Math.max(0.2, Math.min(0.99, hoodPos));
 
@@ -399,7 +431,7 @@ public class MasterTeleOp extends OpMode {
         );
 
         // -----------------------
-        // PIDF position control
+        // PIDF position control (with manual override support)
         // -----------------------
         double errorDeg = safeTargetUnwrappedDeg - currentTurretUnwrappedDeg;
 
@@ -409,67 +441,63 @@ public class MasterTeleOp extends OpMode {
 
         double output = 0.0;
 
-        if (ENABLE_PID) {
-            double minEff = MIN_UNWRAPPED_DEG + LIMIT_MARGIN_DEG;
-            double maxEff = MAX_UNWRAPPED_DEG - LIMIT_MARGIN_DEG;
+        if (!turretManualOverride) {
+            if (ENABLE_PID) {
+                double minEff = MIN_UNWRAPPED_DEG + LIMIT_MARGIN_DEG;
+                double maxEff = MAX_UNWRAPPED_DEG - LIMIT_MARGIN_DEG;
 
-            boolean outsideHard = (currentTurretUnwrappedDeg < MIN_UNWRAPPED_DEG) || (currentTurretUnwrappedDeg > MAX_UNWRAPPED_DEG);
+                boolean outsideHard = (currentTurretUnwrappedDeg < MIN_UNWRAPPED_DEG) || (currentTurretUnwrappedDeg > MAX_UNWRAPPED_DEG);
 
-            if (outsideHard && !ALLOW_RECOVERY_WHEN_OUTSIDE_LIMITS) {
-                output = 0.0;
-            } else {
-                // If outside hard window, only allow motion back inside
-                if (outsideHard) {
-                    if (currentTurretUnwrappedDeg < MIN_UNWRAPPED_DEG && errorDeg <= 0) {
-                        output = 0.0;
-                    } else if (currentTurretUnwrappedDeg > MAX_UNWRAPPED_DEG && errorDeg >= 0) {
-                        output = 0.0;
+                if (outsideHard && !ALLOW_RECOVERY_WHEN_OUTSIDE_LIMITS) {
+                    output = 0.0;
+                } else {
+                    // If outside hard window, only allow motion back inside
+                    if (outsideHard) {
+                        if (currentTurretUnwrappedDeg < MIN_UNWRAPPED_DEG && errorDeg <= 0) {
+                            output = 0.0;
+                        } else if (currentTurretUnwrappedDeg > MAX_UNWRAPPED_DEG && errorDeg >= 0) {
+                            output = 0.0;
+                        } else {
+                            output = pidfStep(errorDeg, dt);
+                        }
                     } else {
+                        // Inside window: normal control, but keep target in effective window already
+                        safeTargetUnwrappedDeg = clamp(safeTargetUnwrappedDeg, minEff, maxEff);
+                        errorDeg = safeTargetUnwrappedDeg - currentTurretUnwrappedDeg;
                         output = pidfStep(errorDeg, dt);
                     }
-                } else {
-                    // Inside window: normal control, but keep target in effective window already
-                    safeTargetUnwrappedDeg = clamp(safeTargetUnwrappedDeg, minEff, maxEff);
-                    errorDeg = safeTargetUnwrappedDeg - currentTurretUnwrappedDeg;
-                    output = pidfStep(errorDeg, dt);
                 }
+            } else {
+                output = 0.0;
+                integral = 0.0;
+                prevError = 0.0;
+                lastOutput = 0.0;
             }
+
+            setTurretPower(output);
         } else {
-            output = 0.0;
+            // MANUAL OVERRIDE: gamepad2 D-pad controls turret directly
+            double manualPower = 0.0;
+            if (gamepad2.dpad_left && !gamepad2.dpad_right) {
+                manualPower = -TURRET_MANUAL_POWER;
+            } else if (gamepad2.dpad_right && !gamepad2.dpad_left) {
+                manualPower = TURRET_MANUAL_POWER;
+            } else {
+                manualPower = 0.0;
+            }
+
+            // Clear PID accumulators while in manual mode so we don't snap when re-enabling
             integral = 0.0;
             prevError = 0.0;
             lastOutput = 0.0;
+
+            setTurretPower(manualPower);
         }
-
-        setTurretPower(output);
-
-        //telemetry.addData("Aim Mode", aimMode);
 
         telemetry.addData("Pose (x,y)", "%.1f, %.1f", p.getX(), p.getY());
         telemetry.addData("Robot Heading", "%.1f deg", robotHeadingDeg);
         telemetry.addData("Dist -> Target", "%.1f in", fieldDistIn);
 
-        //telemetry.addData("Turret Now (wrap)", "%.1f", currentTurretWrappedDeg);
-        //telemetry.addData("Turret Now (raw)", "%.1f", currentTurretUnwrappedDeg);
-
-        //telemetry.addData("Turret Target (wrap)", "%.1f", desiredTurretWrappedDeg);
-        //telemetry.addData("Turret Target (raw)", "%.1f", safeTargetUnwrappedDeg);
-
-        //telemetry.addData("Error (deg)", "%.2f", errorDeg);
-        //telemetry.addData("PID Out", "%.3f", output);
-        //telemetry.addData("kP/kF", "%.3f / %.3f", kP, kF);
-
-        //telemetry.addData("Tag Field Angle", haveTagFieldAngle ? "%.1f" : "none", tagFieldAngleDeg);
-        //telemetry.addData("Tag Fresh", "%s hold=%.0fms", hadRecentTag ? "yes" : "no", tagHoldTimer.milliseconds());
-
-        if (tagSeenThisLoop) {
-            //telemetry.addData("Tag", "id=%d dm=%.1f rawYaw=%.2f usedYaw=%.2f",
-                    //lastTagId, lastDecisionMargin, lastTagYawDegRaw, lastTagYawDegUsed);
-        } else {
-            //telemetry.addData("Tag", "none");
-        }
-
-        //telemetry.addLine("Y = zero turret");
         telemetry.update();
     }
 
@@ -498,6 +526,33 @@ public class MasterTeleOp extends OpMode {
             shooterMode = (shooterMode == ShooterMode.FAR) ? ShooterMode.OFF : ShooterMode.FAR;
         }
         prevMid = mid;
+    }
+
+    // NEW: gamepad2 handler for turret override + relocalization
+    private void gamepad2Controls() {
+        // Toggle manual turret override with gamepad2.start
+        boolean start2 = gamepad2.start;
+        if (start2 && !prevStart2) {
+            turretManualOverride = !turretManualOverride;
+
+            // Clear PID accumulators whenever we toggle modes
+            integral = 0.0;
+            prevError = 0.0;
+            lastOutput = 0.0;
+        }
+        prevStart2 = start2;
+
+        // Relocalize follower pose with gamepad2.y (edge-triggered)
+        boolean y2 = gamepad2.y;
+        if (y2 && !prevY2) {
+            Pose newPose = new Pose(
+                    RELOCALIZE_X,
+                    RELOCALIZE_Y,
+                    Math.toRadians(RELOCALIZE_HEADING_DEG)
+            );
+            follower.setPose(newPose);
+        }
+        prevY2 = y2;
     }
 
     public void transferControl() {
@@ -534,11 +589,11 @@ public class MasterTeleOp extends OpMode {
 
     public void liftControl() {
         if (gamepad1.y) {
-            liftL.setPower(1);
+            liftL.setPower(-1);
             liftR.setPower(1);
         }
         else if (gamepad1.a) {
-            liftL.setPower(-1);
+            liftL.setPower(1);
             liftR.setPower(-1);
         } else {
             liftL.setPower(0);
@@ -548,9 +603,7 @@ public class MasterTeleOp extends OpMode {
 
     public void hoodControl() {
         hood.setPwmEnable();
-        if (gamepad2.a) {
-            hood.setPosition(transferConstants.hoodAngle);
-        }
+        hood.setPosition(hoodPos);
     }
 
     public void lightControl() {
@@ -611,9 +664,6 @@ public class MasterTeleOp extends OpMode {
 
         // Sensor holds
         // Stop bottom stage if lower sees a ball recently, unless driver is reversing
-        if (lowerRecent && (gamepad1.right_trigger > 0)) {
-            p1 = 0.0;
-        }
         // Optional: stop upper stage if upper sees a ball recently, unless reversing
         if (upperRecent) {
             p2 = 0.0;
@@ -689,8 +739,8 @@ public class MasterTeleOp extends OpMode {
             }
 
             case FEEDING: {
-                intake.setPower(-transferConstants.intakePower);
-                intake2.setPower( transferConstants.intakePower);
+                intake.setPower(transferSpeed);
+                intake2.setPower(-transferSpeed);
 
                 if (System.currentTimeMillis() >= transferStateEndMs) {
                     stopper.setPosition(transferConstants.GATE_CLOSED);
@@ -813,12 +863,6 @@ public class MasterTeleOp extends OpMode {
         }
 
         lastOutput = out;
-
-        // Extra guard at the effective window edges to avoid pushing deeper into the margin zone
-        double minEff = MIN_UNWRAPPED_DEG + LIMIT_MARGIN_DEG;
-        double maxEff = MAX_UNWRAPPED_DEG - LIMIT_MARGIN_DEG;
-        // We don't know current position here; caller already clamps target and handles outsideHard recovery.
-        // Keeping this function pure on error.
 
         return out;
     }

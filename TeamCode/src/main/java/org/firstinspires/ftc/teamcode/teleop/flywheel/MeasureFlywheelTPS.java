@@ -29,8 +29,8 @@ public class MeasureFlywheelTPS extends OpMode {
         m2 = hardwareMap.get(DcMotorEx.class, "f2M");
 
         // reverse one so they spin the same direction
-        m1.setDirection(DcMotorSimple.Direction.REVERSE);
-        m2.setDirection(DcMotorSimple.Direction.FORWARD);
+        m1.setDirection(DcMotorSimple.Direction.FORWARD);
+        m2.setDirection(DcMotorSimple.Direction.REVERSE);
 
         m1.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
         m2.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);

@@ -25,4 +25,5 @@ dependencies {
     implementation 'com.bylazar:fullpanels:1.0.6'
     implementation "org.solverslib:core:0.3.3" // core
     implementation "org.solverslib:pedroPathing:0.3.3"
+
 }
